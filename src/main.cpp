@@ -16,6 +16,14 @@ LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 /* LED device (for debugging without UART console) */
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
+/* Display power control (GPIO7 on Reverse board) - MUST be HIGH before display init */
+static const struct gpio_dt_spec display_power =
+	GPIO_DT_SPEC_GET_BY_IDX(DT_PATH(i2c_reg), enable_gpios, 0);
+
+/* Backlight control (GPIO45 on Reverse board) - uses LED subsystem alias */
+static const struct gpio_dt_spec backlight =
+	GPIO_DT_SPEC_GET(DT_ALIAS(backlight), gpios);
+
 /* Display device */
 static const struct device *display_dev;
 
@@ -27,12 +35,73 @@ static lv_obj_t *status_label;
 static uint32_t seconds_counter = 0;
 
 /**
+ * @brief Initialize display power (GPIO7)
+ *
+ * CRITICAL: This MUST be called before display_init()!
+ * GPIO7 controls the display power rail and must be HIGH before
+ * any communication with the ST7789V controller.
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static int display_power_init(void)
+{
+	int ret;
+
+	if (!gpio_is_ready_dt(&display_power)) {
+		LOG_ERR("Display power GPIO not ready - display will not work!");
+		return -ENODEV;
+	}
+
+	ret = gpio_pin_configure_dt(&display_power, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure display power: %d", ret);
+		return ret;
+	}
+
+	gpio_pin_set_dt(&display_power, 1);
+	LOG_INF("Display power enabled (GPIO%d)", display_power.pin);
+
+	/* Wait for power rail to stabilize */
+	k_msleep(10);
+
+	return 0;
+}
+
+/**
+ * @brief Initialize backlight (GPIO45)
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static int backlight_init(void)
+{
+	int ret;
+
+	if (!gpio_is_ready_dt(&backlight)) {
+		LOG_ERR("Backlight GPIO not ready");
+		return -ENODEV;
+	}
+
+	ret = gpio_pin_configure_dt(&backlight, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure backlight: %d", ret);
+		return ret;
+	}
+
+	gpio_pin_set_dt(&backlight, 1);
+	LOG_INF("Backlight enabled (GPIO%d)", backlight.pin);
+
+	return 0;
+}
+
+/**
  * @brief Initialize the display subsystem
  *
  * @return 0 on success, negative errno on failure
  */
 static int display_init(void)
 {
+	int ret;
+
 	display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 
 	if (!device_is_ready(display_dev)) {
@@ -41,6 +110,15 @@ static int display_init(void)
 	}
 
 	LOG_INF("Display device initialized: %s", display_dev->name);
+
+	/* Turn off display blanking - ST7789V may have it on by default */
+	ret = display_blanking_off(display_dev);
+	if (ret < 0) {
+		LOG_ERR("Failed to turn off display blanking: %d", ret);
+		return ret;
+	}
+	LOG_INF("Display blanking disabled");
+
 	return 0;
 }
 
@@ -49,14 +127,19 @@ static int display_init(void)
  */
 static void lvgl_ui_init(void)
 {
+	/* Set screen background color to blue for visibility */
+	lv_obj_t *screen = lv_scr_act();
+	lv_obj_set_style_bg_color(screen, lv_color_hex(0x0000FF), 0);
+	lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
 	/* Create a label for status */
-	status_label = lv_label_create(lv_scr_act());
+	status_label = lv_label_create(screen);
 	lv_label_set_text(status_label, "WeatherSensor v1.0");
 	lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 10);
 	lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), 0);
 
 	/* Create a label for time display */
-	time_label = lv_label_create(lv_scr_act());
+	time_label = lv_label_create(screen);
 	lv_label_set_text(time_label, "00:00:00");
 	lv_obj_align(time_label, LV_ALIGN_CENTER, 0, 0);
 	lv_obj_set_style_text_font(time_label, &lv_font_montserrat_32, 0);
@@ -112,7 +195,22 @@ int main(void)
 		}
 	}
 
-	/* Initialize display */
+	/* CRITICAL INITIALIZATION SEQUENCE:
+	 * 1. Enable display power (GPIO7) first
+	 * 2. Wait for power rail to stabilize
+	 * 3. Initialize display device
+	 * 4. Enable backlight (GPIO45)
+	 */
+	ret = display_power_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize display power: %d", ret);
+		/* Blink LED rapidly to indicate error */
+		while (1) {
+			gpio_pin_toggle_dt(&led);
+			k_msleep(100);
+		}
+	}
+
 	ret = display_init();
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize display: %d", ret);
@@ -121,6 +219,11 @@ int main(void)
 			gpio_pin_toggle_dt(&led);
 			k_msleep(100);
 		}
+	}
+
+	ret = backlight_init();
+	if (ret < 0) {
+		LOG_WRN("Backlight init failed (non-fatal): %d", ret);
 	}
 
 	/* Initialize LVGL UI */

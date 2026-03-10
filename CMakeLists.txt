@@ -6,9 +6,9 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(WeatherSensor)
 
 # Use simple display test (comment out for LVGL version)
-target_sources(app PRIVATE src/main_simple.cpp)
+# target_sources(app PRIVATE src/main_simple.cpp)
 
-# Use LVGL version (uncomment when ready)
-# target_sources(app PRIVATE src/main.cpp)
+# Use LVGL version
+target_sources(app PRIVATE src/main.cpp)
 
 target_include_directories(app PRIVATE inc)
