@@ -1,0 +1,35 @@
+# Alternative config without PM if the above doesn't work
+# Replace prj.conf with this if needed
+
+# SPDX-License-Identifier: Apache-2.0
+
+# C++ Support
+CONFIG_CPP=y
+CONFIG_STD_CPP20=y
+CONFIG_REQUIRES_FULL_LIBCPP=y
+
+# GPIO for LED debugging
+CONFIG_GPIO=y
+
+# Console and Logging via UART
+CONFIG_UART_CONSOLE=y
+CONFIG_CONSOLE=y
+CONFIG_CONSOLE_GETCHAR=y
+CONFIG_LOG=y
+CONFIG_LOG_MODE_IMMEDIATE=y
+CONFIG_LOG_BACKEND_UART=y
+CONFIG_PRINTK=y
+CONFIG_EARLY_CONSOLE=y
+
+# Display Support
+CONFIG_DISPLAY=y
+CONFIG_DISPLAY_LOG_LEVEL_DBG=y
+
+# Heap for dynamic allocation
+CONFIG_HEAP_MEM_POOL_SIZE=32768
+
+# Main stack size
+CONFIG_MAIN_STACK_SIZE=4096
+
+# System clock and timing
+CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000

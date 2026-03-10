@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/zephyr/boards/**)",
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/zephyr/dts/xtensa/espressif/**)",
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/zephyr/dts/**)",
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/zephyr/**)",
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/modules/**)",
+      "Bash(find:*)",
+      "Read(//Users/lukaszronka/projects/zephyr-4.2/sensordiscprocessor/**)",
+      "WebFetch(domain:botland.com.pl)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

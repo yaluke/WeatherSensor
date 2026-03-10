@@ -1,0 +1,61 @@
+/*
+ * Copyright (c) 2026 Lukasz Ronka
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Overlay for ESP32-S2 Reverse TFT Feather
+ * Uses UART0 on GPIO43/44 (DB pin) for console instead of GPIO1/2
+ */
+
+/* Enable ST7789V TFT Display */
+&st7789v_tft {
+	status = "okay";
+};
+
+/* Enable SPI2 for display */
+&spi2 {
+	status = "okay";
+};
+
+/*
+ * UART Configuration for Reverse Board:
+ * GPIO43 (DB pin) = UART0 TX - connects to ESP-Prog TXD0
+ * GPIO44 = UART0 RX - connects to ESP-Prog RXD0 (if needed)
+ *
+ * Note: GPIO1 and GPIO2 are buttons on Reverse board, not UART!
+ */
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-names = "default";
+};
+
+/* Override console to use UART0 instead of UART1 */
+/ {
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+};
+
+/* Configure UART0 pins */
+&pinctrl {
+	uart0_default: uart0_default {
+		group1 {
+			pinmux = <UART0_TX_GPIO43>;
+			output-high;
+		};
+		group2 {
+			pinmux = <UART0_RX_GPIO44>;
+			bias-pull-up;
+		};
+	};
+};
+
+/* Enable I2C for future sensor support */
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+};
+
+/* GPIO already enabled in base board file */
