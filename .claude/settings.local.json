@@ -8,7 +8,8 @@
       "Read(//Users/lukaszronka/projects/zephyr-4.2/modules/**)",
       "Bash(find:*)",
       "Read(//Users/lukaszronka/projects/zephyr-4.2/sensordiscprocessor/**)",
-      "WebFetch(domain:botland.com.pl)"
+      "WebFetch(domain:botland.com.pl)",
+      "WebFetch(domain:wiki.dfrobot.com)"
     ],
     "deny": [],
     "ask": []

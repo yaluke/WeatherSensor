@@ -7,9 +7,15 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 #include <lvgl.h>
 #include <stdio.h>
+
+/* Sensor-specific headers - conditionally included */
+#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
+#include <zephyr/drivers/sensor/ens160.h>
+#endif
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -27,9 +33,27 @@ static const struct gpio_dt_spec backlight =
 /* Display device */
 static const struct device *display_dev;
 
+/* Sensor devices - conditionally compiled based on device tree */
+#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
+static const struct device *bme280;
+#endif
+
+#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
+static const struct device *ens160;
+#endif
+
+/* Sensor data */
+static float temperature = 0.0f;
+static float humidity = 0.0f;
+static float pressure = 0.0f;
+static uint16_t eco2 = 0;
+static uint16_t tvoc = 0;
+static uint8_t aqi = 0;
+
 /* LVGL objects */
 static lv_obj_t *time_label;
 static lv_obj_t *status_label;
+static lv_obj_t *sensor_label;
 
 /* Time counter (seconds since boot) */
 static uint32_t seconds_counter = 0;
@@ -123,29 +147,221 @@ static int display_init(void)
 }
 
 /**
+ * @brief Initialize sensors with extensive logging
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static int sensors_init(void)
+{
+	int sensors_available = 0;
+
+	LOG_INF("=== SENSOR INITIALIZATION START ===");
+
+#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
+	/* BME280 initialization */
+	LOG_INF("Looking up BME280 device...");
+	bme280 = DEVICE_DT_GET_ONE(bosch_bme280);
+
+	if (bme280 == NULL) {
+		LOG_ERR("BME280: DEVICE_DT_GET returned NULL!");
+	} else {
+		LOG_INF("BME280: Device pointer obtained: %p", bme280);
+
+		if (!device_is_ready(bme280)) {
+			LOG_WRN("BME280: Device not ready - skipping BME280");
+			bme280 = NULL;
+		} else {
+			LOG_INF("BME280: Device ready! Name: %s", bme280->name);
+			sensors_available++;
+		}
+	}
+#else
+	LOG_INF("BME280: Not configured in device tree");
+#endif
+
+#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
+	/* ENS160 initialization */
+	LOG_INF("Looking up ENS160 device...");
+	ens160 = DEVICE_DT_GET_ONE(sciosense_ens160);
+
+	if (ens160 == NULL) {
+		LOG_ERR("ENS160: DEVICE_DT_GET returned NULL!");
+	} else {
+		LOG_INF("ENS160: Device pointer obtained: %p", ens160);
+
+		if (!device_is_ready(ens160)) {
+			LOG_WRN("ENS160: Device not ready - skipping ENS160");
+			ens160 = NULL;
+		} else {
+			LOG_INF("ENS160: Device ready! Name: %s", ens160->name);
+			sensors_available++;
+		}
+	}
+#else
+	LOG_INF("ENS160: Not configured in device tree");
+#endif
+
+	/* Check if at least one sensor is available */
+	if (sensors_available == 0) {
+		LOG_ERR("No sensors available!");
+		return -ENODEV;
+	}
+
+	LOG_INF("=== SENSOR INITIALIZATION COMPLETE ===");
+#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
+	LOG_INF("BME280: %s", bme280 ? "AVAILABLE" : "NOT AVAILABLE");
+#endif
+#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
+	LOG_INF("ENS160: %s", ens160 ? "AVAILABLE" : "NOT AVAILABLE");
+#endif
+
+	return 0;
+}
+
+/**
+ * @brief Read sensors with extensive logging
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static int sensors_read(void)
+{
+	struct sensor_value val;
+	int ret;
+
+	LOG_INF("=== SENSOR READ START ===");
+
+#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
+	/* Read BME280 */
+	if (bme280 != NULL) {
+		LOG_INF("BME280: Fetching sample...");
+		ret = sensor_sample_fetch(bme280);
+		if (ret < 0) {
+			LOG_ERR("BME280: sample_fetch failed: %d", ret);
+		} else {
+			LOG_INF("BME280: Sample fetch OK");
+
+			sensor_channel_get(bme280, SENSOR_CHAN_AMBIENT_TEMP, &val);
+			temperature = sensor_value_to_float(&val);
+			LOG_INF("BME280: Temperature = %.2f°C (val1=%d val2=%d)",
+				(double)temperature, val.val1, val.val2);
+
+			sensor_channel_get(bme280, SENSOR_CHAN_HUMIDITY, &val);
+			humidity = sensor_value_to_float(&val);
+			LOG_INF("BME280: Humidity = %.2f%% (val1=%d val2=%d)",
+				(double)humidity, val.val1, val.val2);
+
+			sensor_channel_get(bme280, SENSOR_CHAN_PRESS, &val);
+			pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
+			LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
+				(double)pressure, val.val1, val.val2);
+		}
+	}
+#endif
+
+#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
+	/* Read ENS160 */
+	if (ens160 != NULL) {
+		LOG_INF("ENS160: Fetching sample...");
+		ret = sensor_sample_fetch(ens160);
+		if (ret < 0) {
+			LOG_ERR("ENS160: sample_fetch failed: %d", ret);
+		} else {
+			LOG_INF("ENS160: Sample fetch OK");
+
+			sensor_channel_get(ens160, SENSOR_CHAN_CO2, &val);
+			eco2 = val.val1;
+			LOG_INF("ENS160: eCO2 = %u ppm (val1=%d val2=%d)", eco2, val.val1, val.val2);
+
+			sensor_channel_get(ens160, SENSOR_CHAN_VOC, &val);
+			tvoc = val.val1;
+			LOG_INF("ENS160: TVOC = %u ppb (val1=%d val2=%d)", tvoc, val.val1, val.val2);
+
+			sensor_channel_get(ens160, (enum sensor_channel)SENSOR_CHAN_ENS160_AQI, &val);
+			aqi = val.val1;
+			LOG_INF("ENS160: AQI = %u (val1=%d val2=%d)", aqi, val.val1, val.val2);
+		}
+	}
+#endif
+
+	LOG_INF("=== SENSOR READ COMPLETE ===");
+	return 0;
+}
+
+/**
  * @brief Initialize LVGL UI elements
  */
 static void lvgl_ui_init(void)
 {
-	/* Set screen background color to blue for visibility */
+	/* Set screen background color to black */
 	lv_obj_t *screen = lv_scr_act();
-	lv_obj_set_style_bg_color(screen, lv_color_hex(0x0000FF), 0);
+	lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
 	lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
 	/* Create a label for status */
 	status_label = lv_label_create(screen);
-	lv_label_set_text(status_label, "WeatherSensor v1.0");
-	lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 10);
+	lv_label_set_text(status_label, "WeatherSensor");
+	lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 5);
 	lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), 0);
 
 	/* Create a label for time display */
 	time_label = lv_label_create(screen);
 	lv_label_set_text(time_label, "00:00:00");
-	lv_obj_align(time_label, LV_ALIGN_CENTER, 0, 0);
-	lv_obj_set_style_text_font(time_label, &lv_font_montserrat_32, 0);
-	lv_obj_set_style_text_color(time_label, lv_color_hex(0xFFFFFF), 0);
+	lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -5, 5);
+	lv_obj_set_style_text_color(time_label, lv_color_hex(0xFFFF00), 0);
+
+	/* Create a label for sensor data */
+	sensor_label = lv_label_create(screen);
+	lv_label_set_text(sensor_label, "Initializing...");
+	lv_obj_align(sensor_label, LV_ALIGN_TOP_LEFT, 5, 30);
+	lv_obj_set_style_text_color(sensor_label, lv_color_hex(0xFFFFFF), 0);
 
 	LOG_INF("LVGL UI initialized");
+}
+
+/**
+ * @brief Update sensor display
+ *
+ * Uses integer math to avoid float formatting bug in snprintf.
+ * Sensor values are formatted manually using val1.val2 notation.
+ */
+static void update_sensor_display(void)
+{
+	char buf[256];
+	int temp_int, temp_frac;
+	int hum_int, hum_frac;
+	int press_int;
+
+	/* Extract integer and fractional parts for display
+	 * Note: We read these from global variables which were converted via sensor_value_to_float(),
+	 * but we'll reconstruct them for integer display to avoid float formatting issues.
+	 *
+	 * For now, since we already have float values, multiply by 10 and use integer division.
+	 */
+	temp_int = (int)temperature;
+	temp_frac = (int)((temperature - temp_int) * 10);
+
+	hum_int = (int)humidity;
+	hum_frac = (int)((humidity - hum_int) * 10);
+
+	press_int = (int)pressure;
+
+	snprintf(buf, sizeof(buf),
+		"Temp: %d.%d C\n"
+		"Hum:  %d.%d %%\n"
+		"Press: %d hPa\n"
+		"\n"
+		"AQI:  %u/5\n"
+		"CO2:  %u ppm\n"
+		"TVOC: %u ppb",
+		temp_int, temp_frac,
+		hum_int, hum_frac,
+		press_int,
+		aqi, eco2, tvoc);
+
+	LOG_INF("Display update - Temp=%d.%d C, Hum=%d.%d%%, Press=%d hPa, AQI=%u, CO2=%u, TVOC=%u",
+		temp_int, temp_frac, hum_int, hum_frac, press_int, aqi, eco2, tvoc);
+
+	lv_label_set_text(sensor_label, buf);
 }
 
 /**
@@ -226,8 +442,26 @@ int main(void)
 		LOG_WRN("Backlight init failed (non-fatal): %d", ret);
 	}
 
+	/* Initialize sensors */
+	LOG_INF("");
+	LOG_INF("========================================");
+	ret = sensors_init();
+	if (ret < 0) {
+		LOG_ERR("Sensor initialization failed: %d", ret);
+		LOG_ERR("Continuing without sensors...");
+	}
+	LOG_INF("========================================");
+	LOG_INF("");
+
 	/* Initialize LVGL UI */
 	lvgl_ui_init();
+
+	/* Initial sensor read if sensors available */
+	if (ret == 0) {
+		LOG_INF("Performing initial sensor read...");
+		sensors_read();
+		update_sensor_display();
+	}
 
 	LOG_INF("Initialization complete. Entering main loop...");
 
@@ -239,6 +473,16 @@ int main(void)
 		/* Toggle LED every second to show system is running */
 		led_state = !led_state;
 		gpio_pin_set_dt(&led, led_state);
+
+		/* Read sensors every 10 seconds (testing mode) */
+		if (ret == 0 && (seconds_counter % 10 == 0)) {
+			LOG_INF("");
+			LOG_INF("======== PERIODIC SENSOR READ (t=%us) ========", seconds_counter);
+			sensors_read();
+			update_sensor_display();
+			LOG_INF("===============================================");
+			LOG_INF("");
+		}
 
 		/* Log status every 10 seconds */
 		if (seconds_counter % 10 == 0) {
