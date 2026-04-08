@@ -12,10 +12,7 @@
 #include <lvgl.h>
 #include <stdio.h>
 
-/* Sensor-specific headers - conditionally included */
-#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
 #include <zephyr/drivers/sensor/ens160.h>
-#endif
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -33,14 +30,9 @@ static const struct gpio_dt_spec backlight =
 /* Display device */
 static const struct device *display_dev;
 
-/* Sensor devices - conditionally compiled based on device tree */
-#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
+/* Sensor devices */
 static const struct device *bme280;
-#endif
-
-#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
 static const struct device *ens160;
-#endif
 
 /* Sensor data */
 static float temperature = 0.0f;
@@ -153,68 +145,29 @@ static int display_init(void)
  */
 static int sensors_init(void)
 {
-	int sensors_available = 0;
-
 	LOG_INF("=== SENSOR INITIALIZATION START ===");
 
-#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
 	/* BME280 initialization */
 	LOG_INF("Looking up BME280 device...");
 	bme280 = DEVICE_DT_GET_ONE(bosch_bme280);
 
-	if (bme280 == NULL) {
-		LOG_ERR("BME280: DEVICE_DT_GET returned NULL!");
-	} else {
-		LOG_INF("BME280: Device pointer obtained: %p", bme280);
-
-		if (!device_is_ready(bme280)) {
-			LOG_WRN("BME280: Device not ready - skipping BME280");
-			bme280 = NULL;
-		} else {
-			LOG_INF("BME280: Device ready! Name: %s", bme280->name);
-			sensors_available++;
-		}
+	if (!device_is_ready(bme280)) {
+		LOG_ERR("BME280: Device not ready!");
+		return -ENODEV;
 	}
-#else
-	LOG_INF("BME280: Not configured in device tree");
-#endif
+	LOG_INF("BME280: Device ready - %s", bme280->name);
 
-#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
 	/* ENS160 initialization */
 	LOG_INF("Looking up ENS160 device...");
 	ens160 = DEVICE_DT_GET_ONE(sciosense_ens160);
 
-	if (ens160 == NULL) {
-		LOG_ERR("ENS160: DEVICE_DT_GET returned NULL!");
-	} else {
-		LOG_INF("ENS160: Device pointer obtained: %p", ens160);
-
-		if (!device_is_ready(ens160)) {
-			LOG_WRN("ENS160: Device not ready - skipping ENS160");
-			ens160 = NULL;
-		} else {
-			LOG_INF("ENS160: Device ready! Name: %s", ens160->name);
-			sensors_available++;
-		}
-	}
-#else
-	LOG_INF("ENS160: Not configured in device tree");
-#endif
-
-	/* Check if at least one sensor is available */
-	if (sensors_available == 0) {
-		LOG_ERR("No sensors available!");
+	if (!device_is_ready(ens160)) {
+		LOG_ERR("ENS160: Device not ready!");
 		return -ENODEV;
 	}
+	LOG_INF("ENS160: Device ready - %s", ens160->name);
 
 	LOG_INF("=== SENSOR INITIALIZATION COMPLETE ===");
-#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
-	LOG_INF("BME280: %s", bme280 ? "AVAILABLE" : "NOT AVAILABLE");
-#endif
-#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
-	LOG_INF("ENS160: %s", ens160 ? "AVAILABLE" : "NOT AVAILABLE");
-#endif
-
 	return 0;
 }
 
@@ -230,58 +183,50 @@ static int sensors_read(void)
 
 	LOG_INF("=== SENSOR READ START ===");
 
-#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bme280)
 	/* Read BME280 */
-	if (bme280 != NULL) {
-		LOG_INF("BME280: Fetching sample...");
-		ret = sensor_sample_fetch(bme280);
-		if (ret < 0) {
-			LOG_ERR("BME280: sample_fetch failed: %d", ret);
-		} else {
-			LOG_INF("BME280: Sample fetch OK");
+	LOG_INF("BME280: Fetching sample...");
+	ret = sensor_sample_fetch(bme280);
+	if (ret < 0) {
+		LOG_ERR("BME280: sample_fetch failed: %d", ret);
+	} else {
+		LOG_INF("BME280: Sample fetch OK");
 
-			sensor_channel_get(bme280, SENSOR_CHAN_AMBIENT_TEMP, &val);
-			temperature = sensor_value_to_float(&val);
-			LOG_INF("BME280: Temperature = %.2f°C (val1=%d val2=%d)",
-				(double)temperature, val.val1, val.val2);
+		sensor_channel_get(bme280, SENSOR_CHAN_AMBIENT_TEMP, &val);
+		temperature = sensor_value_to_float(&val);
+		LOG_INF("BME280: Temperature = %.2f°C (val1=%d val2=%d)",
+			(double)temperature, val.val1, val.val2);
 
-			sensor_channel_get(bme280, SENSOR_CHAN_HUMIDITY, &val);
-			humidity = sensor_value_to_float(&val);
-			LOG_INF("BME280: Humidity = %.2f%% (val1=%d val2=%d)",
-				(double)humidity, val.val1, val.val2);
+		sensor_channel_get(bme280, SENSOR_CHAN_HUMIDITY, &val);
+		humidity = sensor_value_to_float(&val);
+		LOG_INF("BME280: Humidity = %.2f%% (val1=%d val2=%d)",
+			(double)humidity, val.val1, val.val2);
 
-			sensor_channel_get(bme280, SENSOR_CHAN_PRESS, &val);
-			pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
-			LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
-				(double)pressure, val.val1, val.val2);
-		}
+		sensor_channel_get(bme280, SENSOR_CHAN_PRESS, &val);
+		pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
+		LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
+			(double)pressure, val.val1, val.val2);
 	}
-#endif
 
-#if DT_HAS_COMPAT_STATUS_OKAY(sciosense_ens160)
 	/* Read ENS160 */
-	if (ens160 != NULL) {
-		LOG_INF("ENS160: Fetching sample...");
-		ret = sensor_sample_fetch(ens160);
-		if (ret < 0) {
-			LOG_ERR("ENS160: sample_fetch failed: %d", ret);
-		} else {
-			LOG_INF("ENS160: Sample fetch OK");
+	LOG_INF("ENS160: Fetching sample...");
+	ret = sensor_sample_fetch(ens160);
+	if (ret < 0) {
+		LOG_ERR("ENS160: sample_fetch failed: %d", ret);
+	} else {
+		LOG_INF("ENS160: Sample fetch OK");
 
-			sensor_channel_get(ens160, SENSOR_CHAN_CO2, &val);
-			eco2 = val.val1;
-			LOG_INF("ENS160: eCO2 = %u ppm (val1=%d val2=%d)", eco2, val.val1, val.val2);
+		sensor_channel_get(ens160, SENSOR_CHAN_CO2, &val);
+		eco2 = val.val1;
+		LOG_INF("ENS160: eCO2 = %u ppm (val1=%d val2=%d)", eco2, val.val1, val.val2);
 
-			sensor_channel_get(ens160, SENSOR_CHAN_VOC, &val);
-			tvoc = val.val1;
-			LOG_INF("ENS160: TVOC = %u ppb (val1=%d val2=%d)", tvoc, val.val1, val.val2);
+		sensor_channel_get(ens160, SENSOR_CHAN_VOC, &val);
+		tvoc = val.val1;
+		LOG_INF("ENS160: TVOC = %u ppb (val1=%d val2=%d)", tvoc, val.val1, val.val2);
 
-			sensor_channel_get(ens160, (enum sensor_channel)SENSOR_CHAN_ENS160_AQI, &val);
-			aqi = val.val1;
-			LOG_INF("ENS160: AQI = %u (val1=%d val2=%d)", aqi, val.val1, val.val2);
-		}
+		sensor_channel_get(ens160, (enum sensor_channel)SENSOR_CHAN_ENS160_AQI, &val);
+		aqi = val.val1;
+		LOG_INF("ENS160: AQI = %u (val1=%d val2=%d)", aqi, val.val1, val.val2);
 	}
-#endif
 
 	LOG_INF("=== SENSOR READ COMPLETE ===");
 	return 0;
