@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## Project Overview
 
-**WeatherSensor** is a battery-powered environmental monitoring system built on the Adafruit Feather ESP32-S2 TFT board running Zephyr RTOS 4.2. The application collects temperature, pressure, humidity, and air quality data from external SPI sensors, displays them locally on the TFT screen, and transmits batched data to a remote server.
+**WeatherSensor** is a battery-powered environmental monitoring system built on the Adafruit Feather ESP32-S2 TFT board running Zephyr RTOS 4.4-rc1. The application collects temperature, pressure, humidity, and air quality data from external SPI sensors, displays them locally on the TFT screen, and transmits batched data to a remote server.
 
 **Key Requirements:**
 - Low power consumption (Li-Ion battery powered)
@@ -62,16 +62,11 @@ WeatherSensor/
 
 ```bash
 # 1. Navigate to workspace root
-cd /Users/lukaszronka/projects/zephyr-4.2
+cd /Users/lukaszronka/projects/zephyr-4.4
 
 # 2. Activate Python virtual environment (required for west and dependencies)
+# SDK path and Zephyr base are configured in .west/config - no extra sourcing needed
 source ./.venv/bin/activate
-
-# 3. Source Zephyr SDK setup (sets ZEPHYR_SDK_INSTALL_DIR)
-source ~/zephyr_sdk_0.17.0.sh
-
-# 4. Source Zephyr environment (sets up west and Zephyr variables)
-source zephyr/zephyr-env.sh
 ```
 
 ### Building and Flashing
@@ -107,7 +102,7 @@ screen /dev/cu.usbserial-1101 115200  # ESP-Prog UART channel
 Add this to your `~/.zshrc` or `~/.bashrc` for convenience:
 
 ```bash
-alias zephyr-setup='cd /Users/lukaszronka/projects/zephyr-4.2 && source ./.venv/bin/activate && source ~/zephyr_sdk_0.17.0.sh && source zephyr/zephyr-env.sh'
+alias zephyr-setup='cd /Users/lukaszronka/projects/zephyr-4.4 && source ./.venv/bin/activate'
 ```
 
 Then simply run:
@@ -124,11 +119,11 @@ Check that the environment is set up correctly:
 # Check Python venv is active (should show venv path)
 which python
 
-# Check SDK is configured (should show SDK path)
-echo $ZEPHYR_SDK_INSTALL_DIR
-
 # Check west is available (should show version)
 west --version
+
+# Check SDK is configured (should show path in .west/config)
+west config build.cmake-args
 ```
 
 ## Architecture Design
@@ -430,7 +425,7 @@ for (int y = 0; y < 240; y += 30) {
 
 ### Environment Setup
 
-- Always activate Python venv, source SDK, and source `zephyr-env.sh` before building
+- Always activate Python venv before building (SDK and Zephyr base are configured in .west/config)
 - See **Build Commands** section for complete setup sequence
 
 ### Hardware Details
