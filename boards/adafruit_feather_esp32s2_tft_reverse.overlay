@@ -84,3 +84,20 @@
 &wifi {
 	status = "okay";
 };
+
+/*
+ * Fix D1/D2 button polarity.
+ * The upstream Zephyr board DTS incorrectly defines D1/D2 as GPIO_PULL_UP | GPIO_ACTIVE_LOW,
+ * but per Adafruit docs these buttons are pulled LOW by default and go HIGH when pressed.
+ * See: https://learn.adafruit.com/esp32-s2-reverse-tft-feather/pinouts
+ */
+/ {
+	gpio_keys {
+		d1_button: d1_button {
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+		};
+		d2_button: d2_button {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
