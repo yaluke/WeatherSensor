@@ -85,4 +85,7 @@
 	};
 };
 
-/* GPIO already enabled in base board file */
+/* Enable MAX17048 fuel gauge for battery monitoring */
+&max17048 {
+	status = "okay";
+};
