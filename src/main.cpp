@@ -9,10 +9,14 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/fuel_gauge.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/kvss/nvs.h>
+#include <zephyr/storage/flash_map.h>
 #include <lvgl.h>
 #include <stdio.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -385,6 +389,78 @@ static void update_battery_display(void)
 }
 
 /* ========================================================================
+ * NVS credential storage (Step 2)
+ * ======================================================================== */
+
+#define NVS_WIFI_SSID_ID  1
+#define NVS_WIFI_PSK_ID   2
+
+static struct nvs_fs nvs_storage;
+
+/**
+ * @brief Mount the NVS filesystem on the storage partition.
+ */
+static int nvs_init_storage(void)
+{
+	struct flash_pages_info info;
+	const struct device *flash_dev = FIXED_PARTITION_DEVICE(storage_partition);
+
+	if (!device_is_ready(flash_dev)) {
+		LOG_ERR("NVS flash device not ready");
+		return -ENODEV;
+	}
+
+	nvs_storage.flash_device = flash_dev;
+	nvs_storage.offset = FIXED_PARTITION_OFFSET(storage_partition);
+
+	int ret = flash_get_page_info_by_offs(flash_dev, nvs_storage.offset, &info);
+	if (ret < 0) {
+		LOG_ERR("Failed to get flash page info: %d", ret);
+		return ret;
+	}
+
+	nvs_storage.sector_size = info.size;
+	nvs_storage.sector_count = 3;
+
+	ret = nvs_mount(&nvs_storage);
+	if (ret < 0) {
+		LOG_ERR("NVS mount failed: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("NVS initialized");
+	return 0;
+}
+
+/**
+ * @brief Load WiFi credentials from NVS.
+ *
+ * @return true on success, false if credentials not stored.
+ */
+static bool wifi_load_credentials(char *ssid, size_t ssid_size,
+				   char *psk, size_t psk_size)
+{
+	if (nvs_read(&nvs_storage, NVS_WIFI_SSID_ID, ssid, ssid_size) <= 0) {
+		return false;
+	}
+	if (nvs_read(&nvs_storage, NVS_WIFI_PSK_ID, psk, psk_size) <= 0) {
+		return false;
+	}
+	LOG_INF("Loaded WiFi credentials from NVS (SSID: %s)", ssid);
+	return true;
+}
+
+/**
+ * @brief Save WiFi credentials to NVS.
+ */
+static void wifi_save_credentials(const char *ssid, const char *psk)
+{
+	nvs_write(&nvs_storage, NVS_WIFI_SSID_ID, ssid, strlen(ssid) + 1);
+	nvs_write(&nvs_storage, NVS_WIFI_PSK_ID, psk, strlen(psk) + 1);
+	LOG_INF("WiFi credentials saved to NVS (SSID: %s)", ssid);
+}
+
+/* ========================================================================
  * LVGL UI construction
  * ======================================================================== */
 
@@ -675,6 +751,17 @@ int main(void)
 	/* Initial battery read */
 	battery_read();
 	update_battery_display();
+
+	/* Initialize NVS and check for stored WiFi credentials */
+	if (nvs_init_storage() == 0) {
+		char ssid[33] = {};
+		char psk[65] = {};
+		if (wifi_load_credentials(ssid, sizeof(ssid), psk, sizeof(psk))) {
+			LOG_INF("WiFi credentials found — will connect in later step");
+		} else {
+			LOG_INF("No WiFi credentials stored — provisioning needed");
+		}
+	}
 
 	LOG_INF("Initialization complete. Entering main loop...");
 
