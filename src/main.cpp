@@ -14,8 +14,6 @@
 #include <lvgl.h>
 #include <stdio.h>
 
-#include <zephyr/drivers/sensor/ens160.h>
-
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
 /* ========================================================================
@@ -40,7 +38,6 @@ static const struct device *display_dev;
 
 /* Sensor devices */
 static const struct device *bme280;
-static const struct device *ens160;
 
 /* Fuel gauge device */
 static const struct device *fuel_gauge_dev;
@@ -52,9 +49,6 @@ static const struct device *fuel_gauge_dev;
 static float temperature = 0.0f;
 static float humidity = 0.0f;
 static float pressure = 0.0f;
-static uint16_t eco2 = 0;
-static uint16_t tvoc = 0;
-static uint8_t aqi = 0;
 
 /* ========================================================================
  * Battery state
@@ -75,22 +69,19 @@ static uint8_t battery_soc = 100; /* State of charge %, mocked at 100% */
  * LVGL objects
  * ======================================================================== */
 
-/* Screen objects */
+/* Screen objects (navigation infrastructure kept for future screens) */
 static lv_obj_t *screen_weather;
-static lv_obj_t *screen_airquality;
 
-/* Screen array for indexed navigation */
-static const int NUM_SCREENS = 2;
+/* Screen array for indexed navigation — grows as more screens are added */
+static const int NUM_SCREENS = 1;
 static int current_screen = 0;
-static lv_obj_t *screens[2];
+static lv_obj_t *screens[NUM_SCREENS];
 
-/* Status bar labels (duplicated on each screen) */
+/* Status bar labels */
 static lv_obj_t *weather_battery_label;
 static lv_obj_t *weather_wifi_label;
-static lv_obj_t *aq_battery_label;
-static lv_obj_t *aq_wifi_label;
 
-/* Screen 1 (Weather) labels */
+/* Weather screen labels */
 static lv_obj_t *weather_time_label;
 static lv_obj_t *weather_temp_value;
 static lv_obj_t *weather_temp_unit;
@@ -98,15 +89,6 @@ static lv_obj_t *weather_hum_value;
 static lv_obj_t *weather_hum_unit;
 static lv_obj_t *weather_press_value;
 static lv_obj_t *weather_press_unit;
-
-/* Screen 2 (Air Quality) labels */
-static lv_obj_t *aq_time_label;
-static lv_obj_t *aq_aqi_value;
-static lv_obj_t *aq_aqi_unit;
-static lv_obj_t *aq_co2_value;
-static lv_obj_t *aq_co2_unit;
-static lv_obj_t *aq_tvoc_value;
-static lv_obj_t *aq_tvoc_unit;
 
 /* Time counter (seconds since boot) */
 static uint32_t seconds_counter = 0;
@@ -285,16 +267,6 @@ static int sensors_init(void)
 	}
 	LOG_INF("BME280: Device ready - %s", bme280->name);
 
-	/* ENS160 initialization */
-	LOG_INF("Looking up ENS160 device...");
-	ens160 = DEVICE_DT_GET_ONE(sciosense_ens160);
-
-	if (!device_is_ready(ens160)) {
-		LOG_ERR("ENS160: Device not ready!");
-		return -ENODEV;
-	}
-	LOG_INF("ENS160: Device ready - %s", ens160->name);
-
 	LOG_INF("=== SENSOR INITIALIZATION COMPLETE ===");
 	return 0;
 }
@@ -333,27 +305,6 @@ static int sensors_read(void)
 		pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
 		LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
 			(double)pressure, val.val1, val.val2);
-	}
-
-	/* Read ENS160 */
-	LOG_INF("ENS160: Fetching sample...");
-	ret = sensor_sample_fetch(ens160);
-	if (ret < 0) {
-		LOG_ERR("ENS160: sample_fetch failed: %d", ret);
-	} else {
-		LOG_INF("ENS160: Sample fetch OK");
-
-		sensor_channel_get(ens160, SENSOR_CHAN_CO2, &val);
-		eco2 = val.val1;
-		LOG_INF("ENS160: eCO2 = %u ppm (val1=%d val2=%d)", eco2, val.val1, val.val2);
-
-		sensor_channel_get(ens160, SENSOR_CHAN_VOC, &val);
-		tvoc = val.val1;
-		LOG_INF("ENS160: TVOC = %u ppb (val1=%d val2=%d)", tvoc, val.val1, val.val2);
-
-		sensor_channel_get(ens160, (enum sensor_channel)SENSOR_CHAN_ENS160_AQI, &val);
-		aqi = val.val1;
-		LOG_INF("ENS160: AQI = %u (val1=%d val2=%d)", aqi, val.val1, val.val2);
 	}
 
 	LOG_INF("=== SENSOR READ COMPLETE ===");
@@ -430,9 +381,7 @@ static const char *battery_symbol(uint8_t soc)
  */
 static void update_battery_display(void)
 {
-	const char *sym = battery_symbol(battery_soc);
-	lv_label_set_text(weather_battery_label, sym);
-	lv_label_set_text(aq_battery_label, sym);
+	lv_label_set_text(weather_battery_label, battery_symbol(battery_soc));
 }
 
 /* ========================================================================
@@ -573,91 +522,20 @@ static void build_weather_screen(void)
 }
 
 /**
- * @brief Build Screen 2: Air Quality data (AQI, CO2, TVOC)
- *
- * Values use large font (Montserrat 32), units use smaller font (Montserrat 16).
- */
-static void build_airquality_screen(void)
-{
-	lv_color_t text_color = lv_color_black();
-	lv_color_t label_color = lv_color_make(100, 100, 100);
-	lv_color_t unit_color = lv_color_make(80, 80, 80);
-	const lv_font_t *font_value = &lv_font_montserrat_32;
-	const lv_font_t *font_unit = &lv_font_montserrat_16;
-	const lv_font_t *font_label = &lv_font_montserrat_14;
-
-	screen_airquality = lv_obj_create(NULL);
-	setup_screen_style(screen_airquality);
-	build_status_bar(screen_airquality, &aq_battery_label, &aq_wifi_label);
-
-	int32_t y = CONTENT_Y_START;
-
-	/* Time HH:MM (centered, big font) */
-	aq_time_label = create_label(screen_airquality, font_value, text_color,
-				     0, y, "00:00");
-	lv_obj_set_width(aq_time_label, 135);
-	lv_obj_set_style_text_align(aq_time_label, LV_TEXT_ALIGN_CENTER, 0);
-	y += 42;
-
-	/* AQ label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "AQ");
-	y += 16;
-
-	/* AQI value (big) + unit (small) */
-	aq_aqi_value = create_label(screen_airquality, font_value, text_color,
-				    CONTENT_X_PAD, y, "--");
-	aq_aqi_unit = create_label(screen_airquality, font_unit, unit_color,
-				   0, 0, "/5");
-	position_unit_label(aq_aqi_unit, aq_aqi_value);
-	y += 42;
-
-	/* CO2 label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "CO2");
-	y += 16;
-
-	/* CO2 value (big) + unit (small) */
-	aq_co2_value = create_label(screen_airquality, font_value, text_color,
-				    CONTENT_X_PAD, y, "--");
-	aq_co2_unit = create_label(screen_airquality, font_unit, unit_color,
-				   0, 0, "ppm");
-	position_unit_label(aq_co2_unit, aq_co2_value);
-	y += 42;
-
-	/* TVOC label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "TVOC");
-	y += 16;
-
-	/* TVOC value (big) + unit (small) */
-	aq_tvoc_value = create_label(screen_airquality, font_value, text_color,
-				     CONTENT_X_PAD, y, "--");
-	aq_tvoc_unit = create_label(screen_airquality, font_unit, unit_color,
-				    0, 0, "ppb");
-	position_unit_label(aq_tvoc_unit, aq_tvoc_value);
-}
-
-/**
  * @brief Initialize the complete LVGL UI
  *
- * Creates two screens with a shared status bar on lv_layer_top.
+ * Navigation infrastructure is kept for future screens.
  */
 static void lvgl_ui_init(void)
 {
-	/* Build individual screens (each includes its own status bar) */
 	build_weather_screen();
-	build_airquality_screen();
 
-	/* Set up screen array for indexed navigation */
 	screens[0] = screen_weather;
-	screens[1] = screen_airquality;
 
-	/* Load the weather screen as the initial screen */
 	lv_screen_load(screen_weather);
 	current_screen = 0;
 
-	LOG_INF("LVGL UI initialized (2 screens + status bar)");
+	LOG_INF("LVGL UI initialized (1 screen + status bar)");
 }
 
 /* ========================================================================
@@ -696,35 +574,11 @@ static void update_weather_display(void)
 }
 
 /**
- * @brief Update Air Quality screen labels with current sensor data
- */
-static void update_airquality_display(void)
-{
-	char buf[16];
-
-	snprintf(buf, sizeof(buf), "%u", aqi);
-	lv_label_set_text(aq_aqi_value, buf);
-	position_unit_label(aq_aqi_unit, aq_aqi_value);
-
-	snprintf(buf, sizeof(buf), "%u", eco2);
-	lv_label_set_text(aq_co2_value, buf);
-	position_unit_label(aq_co2_unit, aq_co2_value);
-
-	snprintf(buf, sizeof(buf), "%u", tvoc);
-	lv_label_set_text(aq_tvoc_value, buf);
-	position_unit_label(aq_tvoc_unit, aq_tvoc_value);
-}
-
-/**
- * @brief Update all sensor display data on both screens
- *
- * Both screens are updated even if only one is visible, so data is
- * current when the user navigates.
+ * @brief Update all sensor display data
  */
 static void update_sensor_display(void)
 {
 	update_weather_display();
-	update_airquality_display();
 
 	int temp_int = (int)temperature;
 	int temp_frac = (int)((temperature - temp_int) * 10);
@@ -735,10 +589,8 @@ static void update_sensor_display(void)
 	int hum_frac = (int)((humidity - hum_int) * 10);
 	int press_int = (int)pressure;
 
-	LOG_INF("Display update - Temp=%d.%d C, Hum=%d.%d%%, Press=%d hPa, "
-		"AQI=%u, CO2=%u, TVOC=%u",
-		temp_int, temp_frac, hum_int, hum_frac, press_int,
-		aqi, eco2, tvoc);
+	LOG_INF("Display update - Temp=%d.%d C, Hum=%d.%d%%, Press=%d hPa",
+		temp_int, temp_frac, hum_int, hum_frac, press_int);
 }
 
 /**
@@ -755,7 +607,6 @@ static void update_time_display(uint32_t seconds)
 	snprintf(time_str, sizeof(time_str), "%02u:%02u", hours, minutes);
 
 	lv_label_set_text(weather_time_label, time_str);
-	lv_label_set_text(aq_time_label, time_str);
 }
 
 /* ========================================================================

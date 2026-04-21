@@ -67,20 +67,10 @@
 	status = "okay";
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 
-	/* DFRobot SEN0335: BME280 + ENS160 combo sensor module
-	 * BME280: Temperature/Humidity/Pressure at I2C address 0x76
-	 * ENS160: Air Quality (AQI/CO2/TVOC) at I2C address 0x53
-	 */
-
-	bme280@76 {
+	/* BME280: Temperature/Humidity/Pressure at I2C address 0x77 */
+	bme280@77 {
 		compatible = "bosch,bme280";
-		reg = <0x76>;
-		status = "okay";
-	};
-
-	ens160@53 {
-		compatible = "sciosense,ens160";
-		reg = <0x53>;
+		reg = <0x77>;
 		status = "okay";
 	};
 };
