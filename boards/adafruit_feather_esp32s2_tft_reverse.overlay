@@ -79,3 +79,8 @@
 &max17048 {
 	status = "okay";
 };
+
+/* Enable WiFi driver (Step 1) */
+&wifi {
+	status = "okay";
+};
