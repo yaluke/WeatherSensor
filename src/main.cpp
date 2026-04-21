@@ -14,6 +14,11 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/kvss/nvs.h>
 #include <zephyr/storage/flash_map.h>
+extern "C" {
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/wifi_mgmt.h>
+}
 #include <lvgl.h>
 #include <stdio.h>
 #include <string.h>
@@ -461,6 +466,55 @@ static void wifi_save_credentials(const char *ssid, const char *psk)
 }
 
 /* ========================================================================
+ * WiFi connection (Step 3)
+ * ======================================================================== */
+
+static struct net_mgmt_event_callback wifi_mgmt_cb;
+
+static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
+				    uint64_t mgmt_event,
+				    struct net_if *iface)
+{
+	ARG_UNUSED(cb);
+	ARG_UNUSED(iface);
+
+	switch (mgmt_event) {
+	case NET_EVENT_WIFI_CONNECT_RESULT:
+		LOG_INF("WiFi connected!");
+		break;
+	case NET_EVENT_WIFI_DISCONNECT_RESULT:
+		LOG_INF("WiFi disconnected");
+		break;
+	default:
+		break;
+	}
+}
+
+/**
+ * @brief Connect to WiFi using the given SSID/password (WPA2-PSK).
+ */
+static int wifi_connect(const char *ssid, const char *psk)
+{
+	struct net_if *iface = net_if_get_default();
+	struct wifi_connect_req_params params = {};
+
+	params.ssid = (const uint8_t *)ssid;
+	params.ssid_length = strlen(ssid);
+	params.psk = (const uint8_t *)psk;
+	params.psk_length = strlen(psk);
+	params.security = WIFI_SECURITY_TYPE_PSK;
+	params.channel = WIFI_CHANNEL_ANY;
+	params.band = WIFI_FREQ_BAND_UNKNOWN;
+
+	LOG_INF("Connecting to WiFi SSID: %s", ssid);
+	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
+	if (ret < 0) {
+		LOG_ERR("WiFi connect request failed: %d", ret);
+	}
+	return ret;
+}
+
+/* ========================================================================
  * LVGL UI construction
  * ======================================================================== */
 
@@ -752,12 +806,22 @@ int main(void)
 	battery_read();
 	update_battery_display();
 
-	/* Initialize NVS and check for stored WiFi credentials */
+	/* Register WiFi management event callback */
+	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
+				     NET_EVENT_WIFI_CONNECT_RESULT |
+				     NET_EVENT_WIFI_DISCONNECT_RESULT);
+	net_mgmt_add_event_callback(&wifi_mgmt_cb);
+
+	/* Initialize NVS and try to connect to WiFi */
 	if (nvs_init_storage() == 0) {
 		char ssid[33] = {};
 		char psk[65] = {};
 		if (wifi_load_credentials(ssid, sizeof(ssid), psk, sizeof(psk))) {
-			LOG_INF("WiFi credentials found — will connect in later step");
+			wifi_connect(ssid, psk);
+		} else if (strlen(CONFIG_WEATHER_WIFI_TEST_SSID) > 0) {
+			LOG_INF("Using Kconfig test credentials for WiFi");
+			wifi_connect(CONFIG_WEATHER_WIFI_TEST_SSID,
+				     CONFIG_WEATHER_WIFI_TEST_PSK);
 		} else {
 			LOG_INF("No WiFi credentials stored — provisioning needed");
 		}
