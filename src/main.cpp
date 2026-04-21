@@ -471,6 +471,12 @@ static void wifi_save_credentials(const char *ssid, const char *psk)
 
 static struct net_mgmt_event_callback wifi_mgmt_cb;
 
+/* When credentials come from Kconfig and WiFi connects, save them to NVS
+ * so the next boot auto-connects without rebuilding. */
+static char pending_save_ssid[33];
+static char pending_save_psk[65];
+static bool pending_save_credentials = false;
+
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 				    uint64_t mgmt_event,
 				    struct net_if *iface)
@@ -481,6 +487,10 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 	switch (mgmt_event) {
 	case NET_EVENT_WIFI_CONNECT_RESULT:
 		LOG_INF("WiFi connected!");
+		if (pending_save_credentials) {
+			pending_save_credentials = false;
+			wifi_save_credentials(pending_save_ssid, pending_save_psk);
+		}
 		break;
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
 		LOG_INF("WiFi disconnected");
@@ -812,7 +822,10 @@ int main(void)
 				     NET_EVENT_WIFI_DISCONNECT_RESULT);
 	net_mgmt_add_event_callback(&wifi_mgmt_cb);
 
-	/* Initialize NVS and try to connect to WiFi */
+	/* Initialize NVS and try to connect to WiFi.
+	 * Priority: stored NVS credentials > Kconfig test credentials.
+	 * If Kconfig credentials connect successfully, they're saved to NVS
+	 * for next boot — so the next reflash won't need the Kconfig override. */
 	if (nvs_init_storage() == 0) {
 		char ssid[33] = {};
 		char psk[65] = {};
@@ -820,8 +833,12 @@ int main(void)
 			wifi_connect(ssid, psk);
 		} else if (strlen(CONFIG_WEATHER_WIFI_TEST_SSID) > 0) {
 			LOG_INF("Using Kconfig test credentials for WiFi");
-			wifi_connect(CONFIG_WEATHER_WIFI_TEST_SSID,
-				     CONFIG_WEATHER_WIFI_TEST_PSK);
+			strncpy(pending_save_ssid, CONFIG_WEATHER_WIFI_TEST_SSID,
+				sizeof(pending_save_ssid) - 1);
+			strncpy(pending_save_psk, CONFIG_WEATHER_WIFI_TEST_PSK,
+				sizeof(pending_save_psk) - 1);
+			pending_save_credentials = true;
+			wifi_connect(pending_save_ssid, pending_save_psk);
 		} else {
 			LOG_INF("No WiFi credentials stored — provisioning needed");
 		}
