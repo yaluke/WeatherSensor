@@ -111,6 +111,9 @@ static uint32_t seconds_counter = 0;
  * Using volatile to ensure visibility between ISR context and main loop. */
 static volatile int pending_navigate = 0;
 
+/* Flag set when D1 pressed — main loop starts provisioning SoftAP. */
+static volatile bool pending_provisioning = false;
+
 
 /**
  * @brief Input event callback for hardware buttons
@@ -139,8 +142,9 @@ static void button_input_cb(struct input_event *evt, void *user_data)
 		pending_navigate = -1;
 		LOG_INF("Button D2 (DOWN) pressed");
 		break;
-	case INPUT_KEY_1: /* D1 button = SET = reserved for future use */
-		LOG_INF("Button D1 (SET) pressed");
+	case INPUT_KEY_1: /* D1 button = SET = start SoftAP provisioning */
+		pending_provisioning = true;
+		LOG_INF("Button D1 (SET) pressed - provisioning requested");
 		break;
 	default:
 		LOG_INF("Unknown button code: %u", evt->code);
@@ -505,7 +509,10 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
  */
 static int wifi_connect(const char *ssid, const char *psk)
 {
-	struct net_if *iface = net_if_get_default();
+	struct net_if *iface = net_if_get_wifi_sta();
+	if (!iface) {
+		iface = net_if_get_default();
+	}
 	struct wifi_connect_req_params params = {};
 
 	params.ssid = (const uint8_t *)ssid;
@@ -522,6 +529,53 @@ static int wifi_connect(const char *ssid, const char *psk)
 		LOG_ERR("WiFi connect request failed: %d", ret);
 	}
 	return ret;
+}
+
+/* ========================================================================
+ * SoftAP provisioning (Step 5 — AP mode only, no DHCP/HTTP server yet)
+ * ======================================================================== */
+
+#define PROVISIONING_AP_SSID "WeatherSensor"
+
+static bool provisioning_active = false;
+
+/**
+ * @brief Start the SoftAP so a phone can see the "WeatherSensor" network.
+ *
+ * Step 5 scope is intentionally minimal: just enable AP mode and log.
+ * DHCP server and HTTP provisioning page come in later steps.
+ */
+static int provisioning_start(void)
+{
+	if (provisioning_active) {
+		LOG_WRN("Provisioning already active");
+		return 0;
+	}
+
+	struct net_if *ap_iface = net_if_get_wifi_sap();
+	if (!ap_iface) {
+		LOG_ERR("AP interface not available");
+		return -ENODEV;
+	}
+
+	struct wifi_connect_req_params ap_config = {};
+	ap_config.ssid = (const uint8_t *)PROVISIONING_AP_SSID;
+	ap_config.ssid_length = strlen(PROVISIONING_AP_SSID);
+	ap_config.security = WIFI_SECURITY_TYPE_NONE;
+	ap_config.channel = WIFI_CHANNEL_ANY;
+	ap_config.band = WIFI_FREQ_BAND_2_4_GHZ;
+
+	LOG_INF("Starting SoftAP: SSID='%s' (open)", PROVISIONING_AP_SSID);
+	int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, ap_iface,
+			   &ap_config, sizeof(ap_config));
+	if (ret < 0) {
+		LOG_ERR("AP enable failed: %d", ret);
+		return ret;
+	}
+
+	provisioning_active = true;
+	LOG_INF("SoftAP enabled — scan for '%s' on your phone", PROVISIONING_AP_SSID);
+	return 0;
 }
 
 /* ========================================================================
@@ -852,6 +906,12 @@ int main(void)
 		if (pending_navigate != 0) {
 			screen_navigate(pending_navigate);
 			pending_navigate = 0;
+		}
+
+		/* Handle pending provisioning request from D1 */
+		if (pending_provisioning) {
+			pending_provisioning = false;
+			provisioning_start();
 		}
 
 		/* Update time display every minute */
