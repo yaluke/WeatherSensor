@@ -18,6 +18,7 @@ extern "C" {
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/dhcpv4_server.h>
 }
 #include <lvgl.h>
 #include <stdio.h>
@@ -113,6 +114,10 @@ static volatile int pending_navigate = 0;
 
 /* Flag set when D1 pressed — main loop starts provisioning SoftAP. */
 static volatile bool pending_provisioning = false;
+
+/* Flag set by WiFi event handler when AP becomes enabled — main loop
+ * assigns the IP address and starts the DHCP server. */
+static volatile bool pending_ap_network_setup = false;
 
 
 /**
@@ -499,7 +504,15 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
 		LOG_INF("WiFi disconnected");
 		break;
+	case NET_EVENT_WIFI_AP_ENABLE_RESULT:
+		LOG_INF("AP enable event fired");
+		pending_ap_network_setup = true;
+		break;
+	case NET_EVENT_WIFI_AP_DISABLE_RESULT:
+		LOG_INF("AP disable event fired");
+		break;
 	default:
+		LOG_INF("WiFi event: 0x%llx", (unsigned long long)mgmt_event);
 		break;
 	}
 }
@@ -509,10 +522,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
  */
 static int wifi_connect(const char *ssid, const char *psk)
 {
-	struct net_if *iface = net_if_get_wifi_sta();
-	if (!iface) {
-		iface = net_if_get_default();
-	}
+	struct net_if *iface = net_if_get_default();
 	struct wifi_connect_req_params params = {};
 
 	params.ssid = (const uint8_t *)ssid;
@@ -545,6 +555,48 @@ static bool provisioning_active = false;
  * Step 5 scope is intentionally minimal: just enable AP mode and log.
  * DHCP server and HTTP provisioning page come in later steps.
  */
+/**
+ * @brief Configure AP interface IP + start DHCP server.
+ * Called from the AP_ENABLE_RESULT event handler once the AP is actually up.
+ */
+static bool ap_network_configured = false;
+
+static void provisioning_configure_ap_network(void)
+{
+	if (ap_network_configured) {
+		return;
+	}
+	struct net_if *ap_iface = net_if_get_default();
+	if (!ap_iface) {
+		LOG_ERR("AP interface not available in event handler");
+		return;
+	}
+	ap_network_configured = true;
+
+	struct in_addr ap_addr, netmask, pool_start;
+	net_addr_pton(AF_INET, "192.168.4.1", &ap_addr);
+	net_addr_pton(AF_INET, "255.255.255.0", &netmask);
+	net_addr_pton(AF_INET, "192.168.4.10", &pool_start);
+
+	net_if_ipv4_set_gw(ap_iface, &ap_addr);
+	if (!net_if_ipv4_addr_add(ap_iface, &ap_addr, NET_ADDR_MANUAL, 0)) {
+		LOG_ERR("Failed to set AP IP address");
+		return;
+	}
+	if (!net_if_ipv4_set_netmask_by_addr(ap_iface, &ap_addr, &netmask)) {
+		LOG_ERR("Failed to set AP netmask");
+	}
+
+	int ret = net_dhcpv4_server_start(ap_iface, &pool_start);
+	if (ret < 0) {
+		LOG_ERR("DHCP server start failed: %d", ret);
+	} else {
+		LOG_INF("DHCP server started (pool: 192.168.4.10 - .13)");
+	}
+	LOG_INF("AP IP: 192.168.4.1 — connect phone to '%s'",
+		PROVISIONING_AP_SSID);
+}
+
 static int provisioning_start(void)
 {
 	if (provisioning_active) {
@@ -552,11 +604,14 @@ static int provisioning_start(void)
 		return 0;
 	}
 
-	struct net_if *ap_iface = net_if_get_wifi_sap();
-	if (!ap_iface) {
-		LOG_ERR("AP interface not available");
-		return -ENODEV;
-	}
+	struct net_if *iface = net_if_get_default();
+
+	/* Disconnect STA first — the esp32 driver switches between STA and AP
+	 * via esp_wifi_set_mode() internally when ap_enable is called. The
+	 * disconnect is needed so the driver sees STA as idle. */
+	LOG_INF("Disconnecting STA before enabling AP...");
+	net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+	k_msleep(500);
 
 	struct wifi_connect_req_params ap_config = {};
 	ap_config.ssid = (const uint8_t *)PROVISIONING_AP_SSID;
@@ -566,7 +621,7 @@ static int provisioning_start(void)
 	ap_config.band = WIFI_FREQ_BAND_2_4_GHZ;
 
 	LOG_INF("Starting SoftAP: SSID='%s' (open)", PROVISIONING_AP_SSID);
-	int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, ap_iface,
+	int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, iface,
 			   &ap_config, sizeof(ap_config));
 	if (ret < 0) {
 		LOG_ERR("AP enable failed: %d", ret);
@@ -574,7 +629,8 @@ static int provisioning_start(void)
 	}
 
 	provisioning_active = true;
-	LOG_INF("SoftAP enabled — scan for '%s' on your phone", PROVISIONING_AP_SSID);
+	/* Network config (IP + DHCP server) happens in the AP_ENABLE_RESULT
+	 * event handler once the interface is actually up. */
 	return 0;
 }
 
@@ -873,7 +929,9 @@ int main(void)
 	/* Register WiFi management event callback */
 	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
 				     NET_EVENT_WIFI_CONNECT_RESULT |
-				     NET_EVENT_WIFI_DISCONNECT_RESULT);
+				     NET_EVENT_WIFI_DISCONNECT_RESULT |
+				     NET_EVENT_WIFI_AP_ENABLE_RESULT |
+				     NET_EVENT_WIFI_AP_DISABLE_RESULT);
 	net_mgmt_add_event_callback(&wifi_mgmt_cb);
 
 	/* Initialize NVS and try to connect to WiFi.
@@ -912,6 +970,12 @@ int main(void)
 		if (pending_provisioning) {
 			pending_provisioning = false;
 			provisioning_start();
+		}
+
+		/* After AP_ENABLE_RESULT fires: assign IP and start DHCP */
+		if (pending_ap_network_setup) {
+			pending_ap_network_setup = false;
+			provisioning_configure_ap_network();
 		}
 
 		/* Update time display every minute */

@@ -85,15 +85,6 @@
 	status = "okay";
 };
 
-/* Second WiFi instance for AP mode (required by ESP32_WIFI_AP_STA_MODE).
- * With AP+STA mode, Zephyr uses one interface for STA and another for AP. */
-/ {
-	wifi_ap: wifi_ap {
-		compatible = "espressif,esp32-wifi";
-		status = "okay";
-	};
-};
-
 /*
  * Fix D1/D2 button polarity.
  * The upstream Zephyr board DTS incorrectly defines D1/D2 as GPIO_PULL_UP | GPIO_ACTIVE_LOW,
