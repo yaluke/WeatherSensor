@@ -67,20 +67,10 @@
 	status = "okay";
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 
-	/* DFRobot SEN0335: BME280 + ENS160 combo sensor module
-	 * BME280: Temperature/Humidity/Pressure at I2C address 0x76
-	 * ENS160: Air Quality (AQI/CO2/TVOC) at I2C address 0x53
-	 */
-
-	bme280@76 {
+	/* BME280: Temperature/Humidity/Pressure at I2C address 0x77 */
+	bme280@77 {
 		compatible = "bosch,bme280";
-		reg = <0x76>;
-		status = "okay";
-	};
-
-	ens160@53 {
-		compatible = "sciosense,ens160";
-		reg = <0x53>;
+		reg = <0x77>;
 		status = "okay";
 	};
 };
@@ -88,4 +78,26 @@
 /* Enable MAX17048 fuel gauge for battery monitoring */
 &max17048 {
 	status = "okay";
+};
+
+/* Enable WiFi driver (Step 1) */
+&wifi {
+	status = "okay";
+};
+
+/*
+ * Fix D1/D2 button polarity.
+ * The upstream Zephyr board DTS incorrectly defines D1/D2 as GPIO_PULL_UP | GPIO_ACTIVE_LOW,
+ * but per Adafruit docs these buttons are pulled LOW by default and go HIGH when pressed.
+ * See: https://learn.adafruit.com/esp32-s2-reverse-tft-feather/pinouts
+ */
+/ {
+	gpio_keys {
+		d1_button: d1_button {
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+		};
+		d2_button: d2_button {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+		};
+	};
 };

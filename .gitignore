@@ -41,6 +41,7 @@ twister-out/
 *.crt
 credentials/
 secrets/
+wifi_test.conf
 
 # Logs
 *.log

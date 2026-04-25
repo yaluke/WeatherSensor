@@ -12,3 +12,7 @@ project(WeatherSensor)
 target_sources(app PRIVATE src/main.cpp)
 
 target_include_directories(app PRIVATE inc)
+
+# -fpermissive needed for Zephyr networking headers (C-style void* casts)
+# when compiled as C++ code.
+target_compile_options(app PRIVATE -fpermissive)

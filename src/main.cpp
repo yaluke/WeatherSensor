@@ -9,12 +9,24 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/fuel_gauge.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/kvss/nvs.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/reboot.h>
+extern "C" {
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/dhcpv4_server.h>
+#include <zephyr/net/socket.h>
+}
+
+#include <errno.h>
 #include <lvgl.h>
 #include <stdio.h>
-
-#include <zephyr/drivers/sensor/ens160.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -40,7 +52,6 @@ static const struct device *display_dev;
 
 /* Sensor devices */
 static const struct device *bme280;
-static const struct device *ens160;
 
 /* Fuel gauge device */
 static const struct device *fuel_gauge_dev;
@@ -52,9 +63,6 @@ static const struct device *fuel_gauge_dev;
 static float temperature = 0.0f;
 static float humidity = 0.0f;
 static float pressure = 0.0f;
-static uint16_t eco2 = 0;
-static uint16_t tvoc = 0;
-static uint8_t aqi = 0;
 
 /* ========================================================================
  * Battery state
@@ -75,22 +83,19 @@ static uint8_t battery_soc = 100; /* State of charge %, mocked at 100% */
  * LVGL objects
  * ======================================================================== */
 
-/* Screen objects */
+/* Screen objects (navigation infrastructure kept for future screens) */
 static lv_obj_t *screen_weather;
-static lv_obj_t *screen_airquality;
 
-/* Screen array for indexed navigation */
-static const int NUM_SCREENS = 2;
+/* Screen array for indexed navigation — grows as more screens are added */
+static const int NUM_SCREENS = 1;
 static int current_screen = 0;
-static lv_obj_t *screens[2];
+static lv_obj_t *screens[NUM_SCREENS];
 
-/* Status bar labels (duplicated on each screen) */
+/* Status bar labels */
 static lv_obj_t *weather_battery_label;
 static lv_obj_t *weather_wifi_label;
-static lv_obj_t *aq_battery_label;
-static lv_obj_t *aq_wifi_label;
 
-/* Screen 1 (Weather) labels */
+/* Weather screen labels */
 static lv_obj_t *weather_time_label;
 static lv_obj_t *weather_temp_value;
 static lv_obj_t *weather_temp_unit;
@@ -98,15 +103,6 @@ static lv_obj_t *weather_hum_value;
 static lv_obj_t *weather_hum_unit;
 static lv_obj_t *weather_press_value;
 static lv_obj_t *weather_press_unit;
-
-/* Screen 2 (Air Quality) labels */
-static lv_obj_t *aq_time_label;
-static lv_obj_t *aq_aqi_value;
-static lv_obj_t *aq_aqi_unit;
-static lv_obj_t *aq_co2_value;
-static lv_obj_t *aq_co2_unit;
-static lv_obj_t *aq_tvoc_value;
-static lv_obj_t *aq_tvoc_unit;
 
 /* Time counter (seconds since boot) */
 static uint32_t seconds_counter = 0;
@@ -119,6 +115,17 @@ static uint32_t seconds_counter = 0;
  * +1 = next screen, -1 = previous screen.
  * Using volatile to ensure visibility between ISR context and main loop. */
 static volatile int pending_navigate = 0;
+
+/* Flag set when D1 pressed — main loop starts provisioning SoftAP. */
+static volatile bool pending_provisioning = false;
+
+/* Flag set by WiFi event handler when AP becomes enabled — main loop
+ * assigns the IP address and starts the DHCP server. */
+static volatile bool pending_ap_network_setup = false;
+
+/* Tracked by WiFi event handler; main loop pushes it to the LVGL icon. */
+static volatile bool wifi_connected = false;
+static volatile bool pending_wifi_icon_update = false;
 
 
 /**
@@ -148,8 +155,9 @@ static void button_input_cb(struct input_event *evt, void *user_data)
 		pending_navigate = -1;
 		LOG_INF("Button D2 (DOWN) pressed");
 		break;
-	case INPUT_KEY_1: /* D1 button = SET = reserved for future use */
-		LOG_INF("Button D1 (SET) pressed");
+	case INPUT_KEY_1: /* D1 button = SET = start SoftAP provisioning */
+		pending_provisioning = true;
+		LOG_INF("Button D1 (SET) pressed - provisioning requested");
 		break;
 	default:
 		LOG_INF("Unknown button code: %u", evt->code);
@@ -285,16 +293,6 @@ static int sensors_init(void)
 	}
 	LOG_INF("BME280: Device ready - %s", bme280->name);
 
-	/* ENS160 initialization */
-	LOG_INF("Looking up ENS160 device...");
-	ens160 = DEVICE_DT_GET_ONE(sciosense_ens160);
-
-	if (!device_is_ready(ens160)) {
-		LOG_ERR("ENS160: Device not ready!");
-		return -ENODEV;
-	}
-	LOG_INF("ENS160: Device ready - %s", ens160->name);
-
 	LOG_INF("=== SENSOR INITIALIZATION COMPLETE ===");
 	return 0;
 }
@@ -333,27 +331,6 @@ static int sensors_read(void)
 		pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
 		LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
 			(double)pressure, val.val1, val.val2);
-	}
-
-	/* Read ENS160 */
-	LOG_INF("ENS160: Fetching sample...");
-	ret = sensor_sample_fetch(ens160);
-	if (ret < 0) {
-		LOG_ERR("ENS160: sample_fetch failed: %d", ret);
-	} else {
-		LOG_INF("ENS160: Sample fetch OK");
-
-		sensor_channel_get(ens160, SENSOR_CHAN_CO2, &val);
-		eco2 = val.val1;
-		LOG_INF("ENS160: eCO2 = %u ppm (val1=%d val2=%d)", eco2, val.val1, val.val2);
-
-		sensor_channel_get(ens160, SENSOR_CHAN_VOC, &val);
-		tvoc = val.val1;
-		LOG_INF("ENS160: TVOC = %u ppb (val1=%d val2=%d)", tvoc, val.val1, val.val2);
-
-		sensor_channel_get(ens160, (enum sensor_channel)SENSOR_CHAN_ENS160_AQI, &val);
-		aqi = val.val1;
-		LOG_INF("ENS160: AQI = %u (val1=%d val2=%d)", aqi, val.val1, val.val2);
 	}
 
 	LOG_INF("=== SENSOR READ COMPLETE ===");
@@ -430,9 +407,571 @@ static const char *battery_symbol(uint8_t soc)
  */
 static void update_battery_display(void)
 {
-	const char *sym = battery_symbol(battery_soc);
-	lv_label_set_text(weather_battery_label, sym);
-	lv_label_set_text(aq_battery_label, sym);
+	lv_label_set_text(weather_battery_label, battery_symbol(battery_soc));
+}
+
+/* ========================================================================
+ * NVS credential storage (Step 2)
+ * ======================================================================== */
+
+#define NVS_WIFI_SSID_ID  1
+#define NVS_WIFI_PSK_ID   2
+
+static struct nvs_fs nvs_storage;
+
+/**
+ * @brief Mount the NVS filesystem on the storage partition.
+ */
+static int nvs_init_storage(void)
+{
+	struct flash_pages_info info;
+	const struct device *flash_dev = FIXED_PARTITION_DEVICE(storage_partition);
+
+	if (!device_is_ready(flash_dev)) {
+		LOG_ERR("NVS flash device not ready");
+		return -ENODEV;
+	}
+
+	nvs_storage.flash_device = flash_dev;
+	nvs_storage.offset = FIXED_PARTITION_OFFSET(storage_partition);
+
+	int ret = flash_get_page_info_by_offs(flash_dev, nvs_storage.offset, &info);
+	if (ret < 0) {
+		LOG_ERR("Failed to get flash page info: %d", ret);
+		return ret;
+	}
+
+	nvs_storage.sector_size = info.size;
+	nvs_storage.sector_count = 3;
+
+	ret = nvs_mount(&nvs_storage);
+	if (ret < 0) {
+		LOG_ERR("NVS mount failed: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("NVS initialized");
+	return 0;
+}
+
+/**
+ * @brief Load WiFi credentials from NVS.
+ *
+ * @return true on success, false if credentials not stored.
+ */
+static bool wifi_load_credentials(char *ssid, size_t ssid_size,
+				   char *psk, size_t psk_size)
+{
+	if (nvs_read(&nvs_storage, NVS_WIFI_SSID_ID, ssid, ssid_size) <= 0) {
+		return false;
+	}
+	if (nvs_read(&nvs_storage, NVS_WIFI_PSK_ID, psk, psk_size) <= 0) {
+		return false;
+	}
+	LOG_INF("Loaded WiFi credentials from NVS (SSID: %s)", ssid);
+	return true;
+}
+
+/**
+ * @brief Save WiFi credentials to NVS.
+ */
+static void wifi_save_credentials(const char *ssid, const char *psk)
+{
+	nvs_write(&nvs_storage, NVS_WIFI_SSID_ID, ssid, strlen(ssid) + 1);
+	nvs_write(&nvs_storage, NVS_WIFI_PSK_ID, psk, strlen(psk) + 1);
+	LOG_INF("WiFi credentials saved to NVS (SSID: %s)", ssid);
+}
+
+/* ========================================================================
+ * WiFi connection (Step 3)
+ * ======================================================================== */
+
+static struct net_mgmt_event_callback wifi_mgmt_cb;
+
+/* When credentials come from Kconfig and WiFi connects, save them to NVS
+ * so the next boot auto-connects without rebuilding. */
+static char pending_save_ssid[33];
+static char pending_save_psk[65];
+static bool pending_save_credentials = false;
+
+static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
+				    uint64_t mgmt_event,
+				    struct net_if *iface)
+{
+	ARG_UNUSED(cb);
+	ARG_UNUSED(iface);
+
+	switch (mgmt_event) {
+	case NET_EVENT_WIFI_CONNECT_RESULT:
+		LOG_INF("WiFi connected!");
+		if (pending_save_credentials) {
+			pending_save_credentials = false;
+			wifi_save_credentials(pending_save_ssid, pending_save_psk);
+		}
+		wifi_connected = true;
+		pending_wifi_icon_update = true;
+		break;
+	case NET_EVENT_WIFI_DISCONNECT_RESULT:
+		LOG_INF("WiFi disconnected");
+		wifi_connected = false;
+		pending_wifi_icon_update = true;
+		break;
+	case NET_EVENT_WIFI_AP_ENABLE_RESULT:
+		LOG_INF("AP enable event fired");
+		pending_ap_network_setup = true;
+		break;
+	case NET_EVENT_WIFI_AP_DISABLE_RESULT:
+		LOG_INF("AP disable event fired");
+		break;
+	default:
+		LOG_INF("WiFi event: 0x%llx", (unsigned long long)mgmt_event);
+		break;
+	}
+}
+
+/**
+ * @brief Connect to WiFi using the given SSID/password (WPA2-PSK).
+ */
+static int wifi_connect(const char *ssid, const char *psk)
+{
+	struct net_if *iface = net_if_get_default();
+	struct wifi_connect_req_params params = {};
+
+	params.ssid = (const uint8_t *)ssid;
+	params.ssid_length = strlen(ssid);
+	params.psk = (const uint8_t *)psk;
+	params.psk_length = strlen(psk);
+	params.security = WIFI_SECURITY_TYPE_PSK;
+	params.channel = WIFI_CHANNEL_ANY;
+	params.band = WIFI_FREQ_BAND_UNKNOWN;
+
+	LOG_INF("Connecting to WiFi SSID: %s", ssid);
+	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
+	if (ret < 0) {
+		LOG_ERR("WiFi connect request failed: %d", ret);
+	}
+	return ret;
+}
+
+/* ========================================================================
+ * SoftAP provisioning (Step 5 — AP mode only, no DHCP/HTTP server yet)
+ * ======================================================================== */
+
+#define PROVISIONING_AP_SSID "WeatherSensor"
+
+static bool provisioning_active = false;
+
+/**
+ * @brief Start the SoftAP so a phone can see the "WeatherSensor" network.
+ *
+ * Step 5 scope is intentionally minimal: just enable AP mode and log.
+ * DHCP server and HTTP provisioning page come in later steps.
+ */
+/**
+ * @brief Configure AP interface IP + start DHCP server.
+ * Called from the AP_ENABLE_RESULT event handler once the AP is actually up.
+ */
+static bool ap_network_configured = false;
+
+/* Forward declaration — defined in the HTTP server section below. */
+static void http_server_start(void);
+
+static void provisioning_configure_ap_network(void)
+{
+	if (ap_network_configured) {
+		return;
+	}
+	struct net_if *ap_iface = net_if_get_default();
+	if (!ap_iface) {
+		LOG_ERR("AP interface not available in event handler");
+		return;
+	}
+	ap_network_configured = true;
+
+	struct in_addr ap_addr, netmask, pool_start;
+	net_addr_pton(AF_INET, "192.168.4.1", &ap_addr);
+	net_addr_pton(AF_INET, "255.255.255.0", &netmask);
+	net_addr_pton(AF_INET, "192.168.4.10", &pool_start);
+
+	net_if_ipv4_set_gw(ap_iface, &ap_addr);
+	if (!net_if_ipv4_addr_add(ap_iface, &ap_addr, NET_ADDR_MANUAL, 0)) {
+		LOG_ERR("Failed to set AP IP address");
+		return;
+	}
+	if (!net_if_ipv4_set_netmask_by_addr(ap_iface, &ap_addr, &netmask)) {
+		LOG_ERR("Failed to set AP netmask");
+	}
+
+	int ret = net_dhcpv4_server_start(ap_iface, &pool_start);
+	if (ret < 0) {
+		LOG_ERR("DHCP server start failed: %d", ret);
+	} else {
+		LOG_INF("DHCP server started (pool: 192.168.4.10 - .13)");
+	}
+
+	http_server_start();
+
+	LOG_INF("AP IP: 192.168.4.1 — connect to '%s' and open http://192.168.4.1/",
+		PROVISIONING_AP_SSID);
+}
+
+/* ========================================================================
+ * Minimal HTTP server for SoftAP provisioning
+ * ========================================================================
+ *
+ * Serves a single HTML form at http://192.168.4.1/ while the AP is up.
+ * GET /         → form with SSID + password fields
+ * POST /connect → URL-decode the form body, persist credentials to NVS,
+ *                 then sys_reboot(SYS_REBOOT_COLD). The new credentials
+ *                 take effect on the clean cold boot rather than via a
+ *                 fragile runtime AP→STA mode transition.
+ */
+
+#define HTTP_PORT      80
+#define HTTP_STACK_SIZE 3072
+#define HTTP_RECV_BUF  2048
+
+K_THREAD_STACK_DEFINE(http_stack, HTTP_STACK_SIZE);
+static struct k_thread http_thread_data;
+static k_tid_t http_thread_tid = NULL;
+static volatile bool http_server_run = false;
+
+/* Credentials received via POST /connect, waiting for main loop to
+ * persist them to NVS and reboot. We reboot rather than transition the
+ * WiFi driver from AP→STA at runtime because the latter is fragile on
+ * ESP32-S2 with Zephyr 4.4 — see plan velvet-zooming-hanrahan.md. */
+static char pending_apply_ssid[33];
+static char pending_apply_psk[65];
+static volatile bool pending_reboot = false;
+
+static const char PROVISIONING_HTML[] =
+	"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+	"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+	"<title>WeatherSensor setup</title>"
+	"<style>body{font-family:sans-serif;margin:2em;max-width:420px}"
+	"label{display:block;margin-top:1em}input{width:100%;padding:.5em;"
+	"font-size:1em;box-sizing:border-box}button{margin-top:1.5em;padding:"
+	".7em 1.5em;font-size:1em}</style></head><body>"
+	"<h1>WeatherSensor WiFi setup</h1>"
+	"<form method=\"POST\" action=\"/connect\">"
+	"<label>SSID<input name=\"ssid\" required></label>"
+	"<label>Password<input name=\"psk\" type=\"password\"></label>"
+	"<button type=\"submit\">Connect</button></form></body></html>";
+
+static void http_send_form(int client_fd)
+{
+	char header[128];
+	int hlen = snprintf(header, sizeof(header),
+		"HTTP/1.0 200 OK\r\n"
+		"Content-Type: text/html; charset=utf-8\r\n"
+		"Content-Length: %u\r\n"
+		"Connection: close\r\n"
+		"\r\n",
+		(unsigned)(sizeof(PROVISIONING_HTML) - 1));
+	zsock_send(client_fd, header, hlen, 0);
+	zsock_send(client_fd, PROVISIONING_HTML,
+		   sizeof(PROVISIONING_HTML) - 1, 0);
+}
+
+static void http_send_simple(int client_fd, const char *status,
+			      const char *body)
+{
+	char buf[256];
+	int len = snprintf(buf, sizeof(buf),
+		"HTTP/1.0 %s\r\n"
+		"Content-Type: text/plain\r\n"
+		"Content-Length: %u\r\n"
+		"Connection: close\r\n"
+		"\r\n%s",
+		status, (unsigned)strlen(body), body);
+	zsock_send(client_fd, buf, len, 0);
+}
+
+/* Decode a URL-encoded substring (`+` → space, `%XX` → byte) from src[0..src_len)
+ * into dst[0..dst_size). Always NUL-terminates. Returns decoded length. */
+static size_t url_decode(const char *src, size_t src_len,
+			 char *dst, size_t dst_size)
+{
+	size_t di = 0;
+	for (size_t si = 0; si < src_len && di + 1 < dst_size; si++) {
+		char c = src[si];
+		if (c == '+') {
+			dst[di++] = ' ';
+		} else if (c == '%' && si + 2 < src_len) {
+			char hex[3] = {src[si + 1], src[si + 2], '\0'};
+			dst[di++] = (char)strtol(hex, NULL, 16);
+			si += 2;
+		} else {
+			dst[di++] = c;
+		}
+	}
+	dst[di] = '\0';
+	return di;
+}
+
+/* Find `name=...` in a URL-encoded form body and URL-decode the value into
+ * out[0..out_size). Returns true on success. */
+static bool form_get_field(const char *body, const char *name,
+			   char *out, size_t out_size)
+{
+	size_t name_len = strlen(name);
+	const char *p = body;
+	while (p && *p) {
+		if (strncmp(p, name, name_len) == 0 && p[name_len] == '=') {
+			const char *val = p + name_len + 1;
+			const char *end = strchr(val, '&');
+			size_t vlen = end ? (size_t)(end - val) : strlen(val);
+			url_decode(val, vlen, out, out_size);
+			return true;
+		}
+		p = strchr(p, '&');
+		if (p) {
+			p++;
+		}
+	}
+	return false;
+}
+
+/* Handle POST /connect: parse the form body, stash credentials for the
+ * main loop to apply. On success, send an HTML page telling the user to
+ * reconnect to their home WiFi. */
+static void http_handle_post_connect(int client_fd, const char *request,
+				     int received)
+{
+	/* Body starts after the blank line \r\n\r\n */
+	const char *body = strstr(request, "\r\n\r\n");
+	if (!body) {
+		http_send_simple(client_fd, "400 Bad Request",
+				 "Missing body");
+		return;
+	}
+	body += 4;
+
+	char ssid[33] = {};
+	char psk[65] = {};
+	if (!form_get_field(body, "ssid", ssid, sizeof(ssid)) ||
+	    strlen(ssid) == 0) {
+		http_send_simple(client_fd, "400 Bad Request",
+				 "SSID required");
+		return;
+	}
+	form_get_field(body, "psk", psk, sizeof(psk));
+
+	LOG_INF("HTTP: received credentials for SSID '%s' (psk len=%u)",
+		ssid, (unsigned)strlen(psk));
+
+	strncpy(pending_apply_ssid, ssid, sizeof(pending_apply_ssid) - 1);
+	pending_apply_ssid[sizeof(pending_apply_ssid) - 1] = '\0';
+	strncpy(pending_apply_psk, psk, sizeof(pending_apply_psk) - 1);
+	pending_apply_psk[sizeof(pending_apply_psk) - 1] = '\0';
+	pending_reboot = true;
+
+	static const char OK_HTML[] =
+		"<!DOCTYPE html><html><body><h1>Saved</h1>"
+		"<p>WeatherSensor will now reboot and connect to your WiFi. "
+		"You can reconnect your phone to your normal network.</p>"
+		"</body></html>";
+	char header[128];
+	int hlen = snprintf(header, sizeof(header),
+		"HTTP/1.0 200 OK\r\n"
+		"Content-Type: text/html; charset=utf-8\r\n"
+		"Content-Length: %u\r\n"
+		"Connection: close\r\n"
+		"\r\n",
+		(unsigned)(sizeof(OK_HTML) - 1));
+	zsock_send(client_fd, header, hlen, 0);
+	zsock_send(client_fd, OK_HTML, sizeof(OK_HTML) - 1, 0);
+}
+
+/* Single static recv buffer — accept loop is serial so no concurrency.
+ * Sized to fit a typical browser POST (User-Agent and friends can be large). */
+static char http_buf[HTTP_RECV_BUF];
+
+/* Read until we have the full HTTP request (headers + Content-Length bytes
+ * of body, if any) or the buffer fills / peer closes. Returns total bytes. */
+static int http_recv_request(int client_fd)
+{
+	int total = 0;
+	int header_end = -1;
+	int content_length = 0;
+
+	while (total < (int)sizeof(http_buf) - 1) {
+		int n = zsock_recv(client_fd, http_buf + total,
+				   sizeof(http_buf) - 1 - total, 0);
+		if (n <= 0) {
+			break;
+		}
+		total += n;
+		http_buf[total] = '\0';
+
+		if (header_end < 0) {
+			char *hdr_end = strstr(http_buf, "\r\n\r\n");
+			if (hdr_end) {
+				header_end = (hdr_end - http_buf) + 4;
+				/* Case-insensitive search for "content-length:". */
+				static const char NEEDLE[] = "content-length:";
+				for (char *p = http_buf; p + 15 < hdr_end; p++) {
+					bool match = true;
+					for (int i = 0; i < 15; i++) {
+						char c = p[i];
+						if (c >= 'A' && c <= 'Z') {
+							c = c - 'A' + 'a';
+						}
+						if (c != NEEDLE[i]) {
+							match = false;
+							break;
+						}
+					}
+					if (match) {
+						content_length =
+							(int)strtol(p + 15,
+								    NULL, 10);
+						break;
+					}
+				}
+			}
+		}
+		if (header_end >= 0 &&
+		    total - header_end >= content_length) {
+			break;
+		}
+	}
+	return total;
+}
+
+static void http_handle_client(int client_fd)
+{
+	int received = http_recv_request(client_fd);
+	if (received <= 0) {
+		zsock_close(client_fd);
+		return;
+	}
+
+	/* Log the request line (first line up to \r or \n) for debugging. */
+	char req_line[80];
+	size_t n = 0;
+	while (n < sizeof(req_line) - 1 && n < (size_t)received &&
+	       http_buf[n] != '\r' && http_buf[n] != '\n') {
+		req_line[n] = http_buf[n];
+		n++;
+	}
+	req_line[n] = '\0';
+	LOG_INF("HTTP: %s", req_line);
+
+	if (strncmp(http_buf, "GET / ", 6) == 0 ||
+	    strncmp(http_buf, "GET /index", 10) == 0) {
+		http_send_form(client_fd);
+	} else if (strncmp(http_buf, "POST /connect", 13) == 0) {
+		http_handle_post_connect(client_fd, http_buf, received);
+	} else if (strncmp(http_buf, "GET ", 4) == 0) {
+		http_send_simple(client_fd, "404 Not Found", "Not found");
+	} else {
+		http_send_simple(client_fd, "400 Bad Request", "Bad request");
+	}
+
+	zsock_close(client_fd);
+}
+
+static void http_server_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+	int server_fd = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (server_fd < 0) {
+		LOG_ERR("HTTP: socket() failed: %d", errno);
+		return;
+	}
+
+	int opt = 1;
+	zsock_setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+			 &opt, sizeof(opt));
+
+	struct sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port = htons(HTTP_PORT);
+
+	if (zsock_bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		LOG_ERR("HTTP: bind() failed: %d", errno);
+		zsock_close(server_fd);
+		return;
+	}
+
+	if (zsock_listen(server_fd, 2) < 0) {
+		LOG_ERR("HTTP: listen() failed: %d", errno);
+		zsock_close(server_fd);
+		return;
+	}
+
+	LOG_INF("HTTP server listening on 192.168.4.1:%d", HTTP_PORT);
+
+	while (http_server_run) {
+		struct sockaddr_in client_addr;
+		socklen_t client_len = sizeof(client_addr);
+		int client_fd = zsock_accept(server_fd,
+					     (struct sockaddr *)&client_addr,
+					     &client_len);
+		if (client_fd < 0) {
+			LOG_WRN("HTTP: accept() failed: %d", errno);
+			break;
+		}
+		LOG_INF("HTTP: client connected");
+		http_handle_client(client_fd);
+	}
+
+	zsock_close(server_fd);
+	LOG_INF("HTTP server stopped");
+}
+
+static void http_server_start(void)
+{
+	if (http_thread_tid) {
+		return;
+	}
+	http_server_run = true;
+	http_thread_tid = k_thread_create(
+		&http_thread_data, http_stack,
+		K_THREAD_STACK_SIZEOF(http_stack),
+		http_server_thread, NULL, NULL, NULL,
+		5, 0, K_NO_WAIT);
+	k_thread_name_set(http_thread_tid, "http_srv");
+}
+
+static int provisioning_start(void)
+{
+	if (provisioning_active) {
+		LOG_WRN("Provisioning already active");
+		return 0;
+	}
+
+	struct net_if *iface = net_if_get_default();
+
+	/* Disconnect STA first — the esp32 driver switches between STA and AP
+	 * via esp_wifi_set_mode() internally when ap_enable is called. The
+	 * disconnect is needed so the driver sees STA as idle. */
+	LOG_INF("Disconnecting STA before enabling AP...");
+	net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+	k_msleep(500);
+
+	struct wifi_connect_req_params ap_config = {};
+	ap_config.ssid = (const uint8_t *)PROVISIONING_AP_SSID;
+	ap_config.ssid_length = strlen(PROVISIONING_AP_SSID);
+	ap_config.security = WIFI_SECURITY_TYPE_NONE;
+	ap_config.channel = WIFI_CHANNEL_ANY;
+	ap_config.band = WIFI_FREQ_BAND_2_4_GHZ;
+
+	LOG_INF("Starting SoftAP: SSID='%s' (open)", PROVISIONING_AP_SSID);
+	int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, iface,
+			   &ap_config, sizeof(ap_config));
+	if (ret < 0) {
+		LOG_ERR("AP enable failed: %d", ret);
+		return ret;
+	}
+
+	provisioning_active = true;
+	/* Network config (IP + DHCP server) happens in the AP_ENABLE_RESULT
+	 * event handler once the interface is actually up. */
+	return 0;
 }
 
 /* ========================================================================
@@ -497,11 +1036,13 @@ static void build_status_bar(lv_obj_t *screen, lv_obj_t **bat_out, lv_obj_t **wi
 	lv_obj_set_style_text_color(*bat_out, lv_color_black(), 0);
 	lv_obj_set_pos(*bat_out, 4, 3);
 
-	/* WiFi icon (right side, top) */
+	/* WiFi icon (right side, top). Starts in the disconnected color;
+	 * wifi_mgmt_event_handler flips it to black on connect. The
+	 * Reverse TFT panel reports BGR, so (0,0,255) renders as red. */
 	*wifi_out = lv_label_create(screen);
 	lv_label_set_text(*wifi_out, LV_SYMBOL_WIFI);
 	lv_obj_set_style_text_font(*wifi_out, &lv_font_montserrat_16, 0);
-	lv_obj_set_style_text_color(*wifi_out, lv_color_make(180, 180, 180), 0);
+	lv_obj_set_style_text_color(*wifi_out, lv_color_make(0, 0, 255), 0);
 	lv_obj_set_pos(*wifi_out, 135 - 24, 3);
 }
 
@@ -573,91 +1114,20 @@ static void build_weather_screen(void)
 }
 
 /**
- * @brief Build Screen 2: Air Quality data (AQI, CO2, TVOC)
- *
- * Values use large font (Montserrat 32), units use smaller font (Montserrat 16).
- */
-static void build_airquality_screen(void)
-{
-	lv_color_t text_color = lv_color_black();
-	lv_color_t label_color = lv_color_make(100, 100, 100);
-	lv_color_t unit_color = lv_color_make(80, 80, 80);
-	const lv_font_t *font_value = &lv_font_montserrat_32;
-	const lv_font_t *font_unit = &lv_font_montserrat_16;
-	const lv_font_t *font_label = &lv_font_montserrat_14;
-
-	screen_airquality = lv_obj_create(NULL);
-	setup_screen_style(screen_airquality);
-	build_status_bar(screen_airquality, &aq_battery_label, &aq_wifi_label);
-
-	int32_t y = CONTENT_Y_START;
-
-	/* Time HH:MM (centered, big font) */
-	aq_time_label = create_label(screen_airquality, font_value, text_color,
-				     0, y, "00:00");
-	lv_obj_set_width(aq_time_label, 135);
-	lv_obj_set_style_text_align(aq_time_label, LV_TEXT_ALIGN_CENTER, 0);
-	y += 42;
-
-	/* AQ label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "AQ");
-	y += 16;
-
-	/* AQI value (big) + unit (small) */
-	aq_aqi_value = create_label(screen_airquality, font_value, text_color,
-				    CONTENT_X_PAD, y, "--");
-	aq_aqi_unit = create_label(screen_airquality, font_unit, unit_color,
-				   0, 0, "/5");
-	position_unit_label(aq_aqi_unit, aq_aqi_value);
-	y += 42;
-
-	/* CO2 label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "CO2");
-	y += 16;
-
-	/* CO2 value (big) + unit (small) */
-	aq_co2_value = create_label(screen_airquality, font_value, text_color,
-				    CONTENT_X_PAD, y, "--");
-	aq_co2_unit = create_label(screen_airquality, font_unit, unit_color,
-				   0, 0, "ppm");
-	position_unit_label(aq_co2_unit, aq_co2_value);
-	y += 42;
-
-	/* TVOC label */
-	create_label(screen_airquality, font_label, label_color,
-		     CONTENT_X_PAD, y, "TVOC");
-	y += 16;
-
-	/* TVOC value (big) + unit (small) */
-	aq_tvoc_value = create_label(screen_airquality, font_value, text_color,
-				     CONTENT_X_PAD, y, "--");
-	aq_tvoc_unit = create_label(screen_airquality, font_unit, unit_color,
-				    0, 0, "ppb");
-	position_unit_label(aq_tvoc_unit, aq_tvoc_value);
-}
-
-/**
  * @brief Initialize the complete LVGL UI
  *
- * Creates two screens with a shared status bar on lv_layer_top.
+ * Navigation infrastructure is kept for future screens.
  */
 static void lvgl_ui_init(void)
 {
-	/* Build individual screens (each includes its own status bar) */
 	build_weather_screen();
-	build_airquality_screen();
 
-	/* Set up screen array for indexed navigation */
 	screens[0] = screen_weather;
-	screens[1] = screen_airquality;
 
-	/* Load the weather screen as the initial screen */
 	lv_screen_load(screen_weather);
 	current_screen = 0;
 
-	LOG_INF("LVGL UI initialized (2 screens + status bar)");
+	LOG_INF("LVGL UI initialized (1 screen + status bar)");
 }
 
 /* ========================================================================
@@ -696,35 +1166,11 @@ static void update_weather_display(void)
 }
 
 /**
- * @brief Update Air Quality screen labels with current sensor data
- */
-static void update_airquality_display(void)
-{
-	char buf[16];
-
-	snprintf(buf, sizeof(buf), "%u", aqi);
-	lv_label_set_text(aq_aqi_value, buf);
-	position_unit_label(aq_aqi_unit, aq_aqi_value);
-
-	snprintf(buf, sizeof(buf), "%u", eco2);
-	lv_label_set_text(aq_co2_value, buf);
-	position_unit_label(aq_co2_unit, aq_co2_value);
-
-	snprintf(buf, sizeof(buf), "%u", tvoc);
-	lv_label_set_text(aq_tvoc_value, buf);
-	position_unit_label(aq_tvoc_unit, aq_tvoc_value);
-}
-
-/**
- * @brief Update all sensor display data on both screens
- *
- * Both screens are updated even if only one is visible, so data is
- * current when the user navigates.
+ * @brief Update all sensor display data
  */
 static void update_sensor_display(void)
 {
 	update_weather_display();
-	update_airquality_display();
 
 	int temp_int = (int)temperature;
 	int temp_frac = (int)((temperature - temp_int) * 10);
@@ -735,10 +1181,8 @@ static void update_sensor_display(void)
 	int hum_frac = (int)((humidity - hum_int) * 10);
 	int press_int = (int)pressure;
 
-	LOG_INF("Display update - Temp=%d.%d C, Hum=%d.%d%%, Press=%d hPa, "
-		"AQI=%u, CO2=%u, TVOC=%u",
-		temp_int, temp_frac, hum_int, hum_frac, press_int,
-		aqi, eco2, tvoc);
+	LOG_INF("Display update - Temp=%d.%d C, Hum=%d.%d%%, Press=%d hPa",
+		temp_int, temp_frac, hum_int, hum_frac, press_int);
 }
 
 /**
@@ -755,7 +1199,6 @@ static void update_time_display(uint32_t seconds)
 	snprintf(time_str, sizeof(time_str), "%02u:%02u", hours, minutes);
 
 	lv_label_set_text(weather_time_label, time_str);
-	lv_label_set_text(aq_time_label, time_str);
 }
 
 /* ========================================================================
@@ -825,6 +1268,36 @@ int main(void)
 	battery_read();
 	update_battery_display();
 
+	/* Register WiFi management event callback */
+	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
+				     NET_EVENT_WIFI_CONNECT_RESULT |
+				     NET_EVENT_WIFI_DISCONNECT_RESULT |
+				     NET_EVENT_WIFI_AP_ENABLE_RESULT |
+				     NET_EVENT_WIFI_AP_DISABLE_RESULT);
+	net_mgmt_add_event_callback(&wifi_mgmt_cb);
+
+	/* Initialize NVS and try to connect to WiFi.
+	 * Priority: stored NVS credentials > Kconfig test credentials.
+	 * If Kconfig credentials connect successfully, they're saved to NVS
+	 * for next boot — so the next reflash won't need the Kconfig override. */
+	if (nvs_init_storage() == 0) {
+		char ssid[33] = {};
+		char psk[65] = {};
+		if (wifi_load_credentials(ssid, sizeof(ssid), psk, sizeof(psk))) {
+			wifi_connect(ssid, psk);
+		} else if (strlen(CONFIG_WEATHER_WIFI_TEST_SSID) > 0) {
+			LOG_INF("Using Kconfig test credentials for WiFi");
+			strncpy(pending_save_ssid, CONFIG_WEATHER_WIFI_TEST_SSID,
+				sizeof(pending_save_ssid) - 1);
+			strncpy(pending_save_psk, CONFIG_WEATHER_WIFI_TEST_PSK,
+				sizeof(pending_save_psk) - 1);
+			pending_save_credentials = true;
+			wifi_connect(pending_save_ssid, pending_save_psk);
+		} else {
+			LOG_INF("No WiFi credentials stored — provisioning needed");
+		}
+	}
+
 	LOG_INF("Initialization complete. Entering main loop...");
 
 	/* Main loop */
@@ -833,6 +1306,44 @@ int main(void)
 		if (pending_navigate != 0) {
 			screen_navigate(pending_navigate);
 			pending_navigate = 0;
+		}
+
+		/* Handle pending provisioning request from D1 */
+		if (pending_provisioning) {
+			pending_provisioning = false;
+			provisioning_start();
+		}
+
+		/* After AP_ENABLE_RESULT fires: assign IP and start DHCP */
+		if (pending_ap_network_setup) {
+			pending_ap_network_setup = false;
+			provisioning_configure_ap_network();
+		}
+
+		/* Credentials received via HTTP form: persist to NVS and
+		 * reboot. The new credentials take effect on the clean cold
+		 * boot, avoiding fragile runtime AP→STA driver transitions. */
+		if (pending_reboot) {
+			pending_reboot = false;
+			LOG_INF("Saving credentials and rebooting (SSID: %s)",
+				pending_apply_ssid);
+			wifi_save_credentials(pending_apply_ssid,
+					      pending_apply_psk);
+			/* Let the HTTP response flush to the browser. */
+			k_msleep(1000);
+			sys_reboot(SYS_REBOOT_COLD);
+			/* unreachable */
+		}
+
+		/* WiFi status-bar icon: black = connected, red = disconnected.
+		 * The Adafruit Reverse TFT panel reports BGR despite an RGB
+		 * config, so we pass (0, 0, 255) to actually render red. */
+		if (pending_wifi_icon_update) {
+			pending_wifi_icon_update = false;
+			lv_color_t c = wifi_connected
+				? lv_color_black()
+				: lv_color_make(0, 0, 255);
+			lv_obj_set_style_text_color(weather_wifi_label, c, 0);
 		}
 
 		/* Update time display every minute */
