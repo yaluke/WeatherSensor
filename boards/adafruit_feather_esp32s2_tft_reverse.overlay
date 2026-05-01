@@ -93,10 +93,12 @@
  */
 / {
 	gpio_keys {
-		/* 50 ms filter — comfortably under the ~100 ms human-perception
-		 * threshold but far above the few-ms electrical glitches we've
-		 * seen as spurious D2 presses. Applies to all child buttons. */
-		debounce-interval-ms = <50>;
+		/* 100 ms filter at the gpio-keys driver level. Still below the
+		 * ~150 ms human-press threshold so real presses pass through
+		 * unnoticeably late, but doubled from the original 50 ms after
+		 * a second phantom D2 press slipped through. The app also
+		 * applies an additional 80 ms hold filter — see button_input_cb. */
+		debounce-interval-ms = <100>;
 
 		d1_button: d1_button {
 			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
