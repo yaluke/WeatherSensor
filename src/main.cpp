@@ -21,12 +21,15 @@ extern "C" {
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/net/sntp.h>
 }
 
 #include <errno.h>
 #include <lvgl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -83,17 +86,19 @@ static uint8_t battery_soc = 100; /* State of charge %, mocked at 100% */
  * LVGL objects
  * ======================================================================== */
 
-/* Screen objects (navigation infrastructure kept for future screens) */
+/* Screen objects */
 static lv_obj_t *screen_weather;
+static lv_obj_t *screen_drift;
 
-/* Screen array for indexed navigation — grows as more screens are added */
-static const int NUM_SCREENS = 1;
+/* Screen array for indexed navigation. */
+static const int NUM_SCREENS = 2;
 static int current_screen = 0;
 static lv_obj_t *screens[NUM_SCREENS];
 
-/* Status bar labels */
-static lv_obj_t *weather_battery_label;
-static lv_obj_t *weather_wifi_label;
+/* Status-bar labels — one pair per screen. The same WiFi/battery state
+ * is reflected on whichever screen the user happens to be viewing. */
+static lv_obj_t *battery_labels[NUM_SCREENS];
+static lv_obj_t *wifi_labels[NUM_SCREENS];
 
 /* Weather screen labels */
 static lv_obj_t *weather_time_label;
@@ -103,6 +108,11 @@ static lv_obj_t *weather_hum_value;
 static lv_obj_t *weather_hum_unit;
 static lv_obj_t *weather_press_value;
 static lv_obj_t *weather_press_unit;
+
+/* Drift screen labels — one row per ring slot, plus a header. */
+#define DRIFT_HISTORY_SIZE 8
+static lv_obj_t *drift_title_label;
+static lv_obj_t *drift_row_labels[DRIFT_HISTORY_SIZE];
 
 /* Time counter (seconds since boot) */
 static uint32_t seconds_counter = 0;
@@ -126,6 +136,32 @@ static volatile bool pending_ap_network_setup = false;
 /* Tracked by WiFi event handler; main loop pushes it to the LVGL icon. */
 static volatile bool wifi_connected = false;
 static volatile bool pending_wifi_icon_update = false;
+
+/* SNTP time-of-day sync state.
+ * - time_synced: false until the first successful sync; until then the time
+ *   display falls back to uptime so the screen isn't blank at boot.
+ * - seconds_since_last_sync: counts main-loop ticks since the last successful
+ *   sync; main loop triggers a re-sync when it crosses TIME_SYNC_INTERVAL_S.
+ * - pending_initial_sync: set by the WiFi connect event handler so the very
+ *   first sync runs as soon as we have an IP, not on a fixed cadence boundary.
+ */
+static bool time_synced = false;
+static uint32_t seconds_since_last_sync = 0;
+static volatile bool pending_initial_sync = false;
+
+/* Ring buffer of recent SNTP drift measurements (last DRIFT_HISTORY_SIZE
+ * comparisons; the very first sync is excluded — there's nothing to
+ * compare it against). Written by sntp_sync_time() and read by
+ * update_drift_display() in the main loop. */
+struct drift_entry {
+	int64_t drift_ms;
+	uint32_t interval_s;
+	struct tm local_tm;
+	bool valid;
+};
+static struct drift_entry drift_history[DRIFT_HISTORY_SIZE];
+static int drift_head = 0;  /* next slot to overwrite */
+static volatile bool pending_drift_screen_update = false;
 
 
 /**
@@ -407,7 +443,10 @@ static const char *battery_symbol(uint8_t soc)
  */
 static void update_battery_display(void)
 {
-	lv_label_set_text(weather_battery_label, battery_symbol(battery_soc));
+	const char *sym = battery_symbol(battery_soc);
+	for (int i = 0; i < NUM_SCREENS; i++) {
+		lv_label_set_text(battery_labels[i], sym);
+	}
 }
 
 /* ========================================================================
@@ -510,6 +549,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		wifi_connected = true;
 		pending_wifi_icon_update = true;
+		pending_initial_sync = true;
 		break;
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
 		LOG_INF("WiFi disconnected");
@@ -551,6 +591,76 @@ static int wifi_connect(const char *ssid, const char *psk)
 		LOG_ERR("WiFi connect request failed: %d", ret);
 	}
 	return ret;
+}
+
+/* ========================================================================
+ * SNTP wall-clock sync
+ * ========================================================================
+ *
+ * sntp_simple() blocks for up to its timeout (5 s here) including DNS
+ * resolution. That's an acceptable stall for a 1-hour cadence — never
+ * during user interaction — so we run it inline from the main loop
+ * rather than spawning a workqueue.
+ */
+
+#define SNTP_SERVER             "pool.ntp.org"
+#define SNTP_TIMEOUT_MS         5000
+#define TIME_SYNC_INTERVAL_S    3600  /* 1 hour */
+
+/* Convert an SNTP fractional-second value (Q32.32 fixed-point) to nanoseconds. */
+static inline uint32_t sntp_fraction_to_ns(uint64_t fraction)
+{
+	return (uint32_t)((fraction * NSEC_PER_SEC) >> 32);
+}
+
+static int sntp_sync_time(void)
+{
+	struct sntp_time st;
+	int ret = sntp_simple(SNTP_SERVER, SNTP_TIMEOUT_MS, &st);
+	if (ret < 0) {
+		LOG_WRN("SNTP sync failed: %d (keeping previous time)", ret);
+		return ret;
+	}
+
+	struct timespec new_ts = {
+		.tv_sec  = (time_t)st.seconds,
+		.tv_nsec = sntp_fraction_to_ns(st.fraction),
+	};
+
+	if (time_synced) {
+		struct timespec before;
+		clock_gettime(CLOCK_REALTIME, &before);
+		int64_t before_ms = (int64_t)before.tv_sec * 1000 +
+				    before.tv_nsec / 1000000;
+		int64_t new_ms    = (int64_t)new_ts.tv_sec * 1000 +
+				    new_ts.tv_nsec / 1000000;
+		int64_t drift_ms  = before_ms - new_ms;
+		LOG_INF("SNTP synced: drift = %+lld ms over %u s",
+			(long long)drift_ms, seconds_since_last_sync);
+
+		struct drift_entry *slot = &drift_history[drift_head];
+		slot->drift_ms = drift_ms;
+		slot->interval_s = seconds_since_last_sync;
+		localtime_r(&new_ts.tv_sec, &slot->local_tm);
+		slot->valid = true;
+		drift_head = (drift_head + 1) % DRIFT_HISTORY_SIZE;
+		pending_drift_screen_update = true;
+	} else {
+		struct tm utc;
+		gmtime_r(&new_ts.tv_sec, &utc);
+		LOG_INF("SNTP synced: initial value %04d-%02d-%02d %02d:%02d:%02d UTC",
+			utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+			utc.tm_hour, utc.tm_min, utc.tm_sec);
+	}
+
+	if (clock_settime(CLOCK_REALTIME, &new_ts) < 0) {
+		LOG_ERR("clock_settime failed: %d", errno);
+		return -errno;
+	}
+
+	time_synced = true;
+	seconds_since_last_sync = 0;
+	return 0;
 }
 
 /* ========================================================================
@@ -1063,7 +1173,7 @@ static void build_weather_screen(void)
 
 	screen_weather = lv_obj_create(NULL);
 	setup_screen_style(screen_weather);
-	build_status_bar(screen_weather, &weather_battery_label, &weather_wifi_label);
+	build_status_bar(screen_weather, &battery_labels[0], &wifi_labels[0]);
 
 	int32_t y = CONTENT_Y_START;
 
@@ -1114,20 +1224,52 @@ static void build_weather_screen(void)
 }
 
 /**
- * @brief Initialize the complete LVGL UI
+ * @brief Build screen 2: SNTP drift history
  *
- * Navigation infrastructure is kept for future screens.
+ * Shows the last DRIFT_HISTORY_SIZE drift values, one per row, oldest at
+ * top. Rows are pre-allocated with placeholder text; update_drift_display()
+ * fills them from the ring buffer.
+ */
+static void build_drift_screen(void)
+{
+	lv_color_t text_color = lv_color_black();
+	lv_color_t label_color = lv_color_make(100, 100, 100);
+	const lv_font_t *font_title = &lv_font_montserrat_14;
+	const lv_font_t *font_row = &lv_font_montserrat_16;
+
+	screen_drift = lv_obj_create(NULL);
+	setup_screen_style(screen_drift);
+	build_status_bar(screen_drift, &battery_labels[1], &wifi_labels[1]);
+
+	int32_t y = CONTENT_Y_START;
+
+	drift_title_label = create_label(screen_drift, font_title, label_color,
+					 CONTENT_X_PAD, y, "DRIFT (ms)");
+	y += 18;
+
+	for (int i = 0; i < DRIFT_HISTORY_SIZE; i++) {
+		drift_row_labels[i] = create_label(screen_drift, font_row,
+						   text_color,
+						   CONTENT_X_PAD, y, "--");
+		y += 22;
+	}
+}
+
+/**
+ * @brief Initialize the complete LVGL UI
  */
 static void lvgl_ui_init(void)
 {
 	build_weather_screen();
+	build_drift_screen();
 
 	screens[0] = screen_weather;
+	screens[1] = screen_drift;
 
 	lv_screen_load(screen_weather);
 	current_screen = 0;
 
-	LOG_INF("LVGL UI initialized (1 screen + status bar)");
+	LOG_INF("LVGL UI initialized (%d screens + status bar)", NUM_SCREENS);
 }
 
 /* ========================================================================
@@ -1186,19 +1328,95 @@ static void update_sensor_display(void)
 }
 
 /**
- * @brief Update time display on both screens
+ * @brief Returns true at most once per wall-clock minute, on the boundary.
  *
- * @param seconds Number of seconds since boot
+ * After SNTP has set the clock we use tm_min from local time; before
+ * that we fall back to an uptime-minute boundary so the display is
+ * never frozen. Accepts tm_sec == 0 or 1 to absorb scheduler jitter
+ * from the 1 s main-loop tick; the last-minute dedupe ensures only
+ * one fire per minute regardless.
  */
-static void update_time_display(uint32_t seconds)
+static bool minute_boundary_fired(void)
 {
-	uint32_t hours = seconds / 3600;
-	uint32_t minutes = (seconds % 3600) / 60;
+	static int last_minute_fired = -1;
+	int minute_now;
 
+	if (time_synced) {
+		struct timespec ts;
+		struct tm local;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		localtime_r(&ts.tv_sec, &local);
+		if (local.tm_sec > 1) {
+			return false;
+		}
+		minute_now = local.tm_min;
+	} else {
+		uint32_t up_s = (uint32_t)(k_uptime_get() / 1000);
+		if (up_s % 60 != 0) {
+			return false;
+		}
+		minute_now = (int)((up_s / 60) % 60);
+	}
+
+	if (minute_now == last_minute_fired) {
+		return false;
+	}
+	last_minute_fired = minute_now;
+	return true;
+}
+
+/**
+ * @brief Update the on-screen time label.
+ *
+ * Once SNTP has synced the system clock at least once we render local
+ * (Europe/Warsaw, DST-aware) HH:MM. Until then we fall back to an
+ * uptime-based HH:MM so the display is never blank — but at least the
+ * boot-time clock won't pretend to be a real wall time.
+ */
+static void update_time_display(void)
+{
 	char time_str[16];
-	snprintf(time_str, sizeof(time_str), "%02u:%02u", hours, minutes);
+
+	if (time_synced) {
+		struct timespec ts;
+		struct tm local;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		localtime_r(&ts.tv_sec, &local);
+		snprintf(time_str, sizeof(time_str),
+			 "%02d:%02d", local.tm_hour, local.tm_min);
+	} else {
+		uint32_t up_s = (uint32_t)(k_uptime_get() / 1000);
+		snprintf(time_str, sizeof(time_str),
+			 "%02u:%02u", up_s / 3600, (up_s % 3600) / 60);
+	}
 
 	lv_label_set_text(weather_time_label, time_str);
+}
+
+/**
+ * @brief Render the drift ring buffer onto the drift screen.
+ *
+ * Walks the ring oldest → newest so the most recent value is at the
+ * bottom of the screen (visually matches a chat-log "scroll" feel).
+ * Empty slots get a "--" placeholder.
+ */
+static void update_drift_display(void)
+{
+	for (int i = 0; i < DRIFT_HISTORY_SIZE; i++) {
+		int idx = (drift_head + i) % DRIFT_HISTORY_SIZE;
+		const struct drift_entry *e = &drift_history[idx];
+		char row[32];
+
+		if (e->valid) {
+			snprintf(row, sizeof(row),
+				 "%02d:%02d  %+lld",
+				 e->local_tm.tm_hour, e->local_tm.tm_min,
+				 (long long)e->drift_ms);
+		} else {
+			snprintf(row, sizeof(row), "--");
+		}
+		lv_label_set_text(drift_row_labels[i], row);
+	}
 }
 
 /* ========================================================================
@@ -1211,6 +1429,14 @@ int main(void)
 
 	LOG_INF("WeatherSensor starting...");
 	LOG_INF("Board: %s", CONFIG_BOARD);
+
+	/* Pin local time to Europe/Warsaw with DST. POSIX TZ string:
+	 *   CET-1CEST,M3.5.0,M10.5.0/3
+	 * = standard CET (UTC+1), DST CEST (UTC+2), spring-forward last
+	 * Sunday of March, fall-back last Sunday of October at 03:00.
+	 * After this, picolibc's localtime_r() handles DST automatically. */
+	setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+	tzset();
 
 	/* CRITICAL INITIALIZATION SEQUENCE:
 	 * 1. Enable display power (GPIO7) first
@@ -1343,20 +1569,43 @@ int main(void)
 			lv_color_t c = wifi_connected
 				? lv_color_black()
 				: lv_color_make(0, 0, 255);
-			lv_obj_set_style_text_color(weather_wifi_label, c, 0);
+			for (int i = 0; i < NUM_SCREENS; i++) {
+				lv_obj_set_style_text_color(wifi_labels[i],
+							    c, 0);
+			}
 		}
 
-		/* Update time display every minute */
-		if (seconds_counter % 60 == 0) {
-			update_time_display(seconds_counter);
+		/* New SNTP drift sample arrived — repaint the drift screen.
+		 * Cheap; LVGL only redraws the active screen. */
+		if (pending_drift_screen_update) {
+			pending_drift_screen_update = false;
+			update_drift_display();
 		}
 
-		/* Read sensors every 10 seconds */
-		if (sensors_ok && (seconds_counter % 10 == 0)) {
-			LOG_INF("======== PERIODIC SENSOR READ (t=%us) ========",
-				seconds_counter);
-			sensors_read();
-			update_sensor_display();
+		/* SNTP wall-clock sync: first sync as soon as WiFi is up,
+		 * then every TIME_SYNC_INTERVAL_S after a successful sync.
+		 * sntp_sync_time() blocks for up to SNTP_TIMEOUT_MS — fine
+		 * at this cadence. */
+		if (pending_initial_sync) {
+			pending_initial_sync = false;
+			sntp_sync_time();
+		} else if (wifi_connected && time_synced &&
+			   seconds_since_last_sync >= TIME_SYNC_INTERVAL_S) {
+			sntp_sync_time();
+		}
+
+		/* Once per minute, aligned to the wall-clock minute start
+		 * (or the uptime-minute start before SNTP has synced). One
+		 * trigger keeps the sensor read and the visible HH:MM
+		 * transition phase-locked. */
+		if (minute_boundary_fired()) {
+			update_time_display();
+			if (sensors_ok) {
+				LOG_INF("======== PERIODIC SENSOR READ (t=%us) ========",
+					seconds_counter);
+				sensors_read();
+				update_sensor_display();
+			}
 		}
 
 		/* Read battery every 60 seconds */
@@ -1377,6 +1626,7 @@ int main(void)
 		/* Sleep for 1 second */
 		k_msleep(1000);
 		seconds_counter++;
+		seconds_since_last_sync++;
 	}
 
 	return 0;
