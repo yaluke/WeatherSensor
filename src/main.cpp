@@ -1159,6 +1159,27 @@ static void position_unit_label(lv_obj_t *unit, lv_obj_t *value)
 }
 
 /**
+ * @brief Center a value+unit pair horizontally on the 135 px wide screen.
+ *
+ * Computes the combined width (value + 2 px gap + unit, matching
+ * position_unit_label's spacing), slides the value's x so the group
+ * is centered, then re-places the unit relative to the new value
+ * position. Call after every text update to the value label since
+ * its width can change (e.g. "999" vs "1010").
+ */
+static void center_value_unit(lv_obj_t *value, lv_obj_t *unit)
+{
+	lv_obj_update_layout(value);
+	lv_obj_update_layout(unit);
+	int32_t vw = lv_obj_get_width(value);
+	int32_t uw = lv_obj_get_width(unit);
+	int32_t total = vw + 2 + uw;
+	int32_t new_vx = (135 - total) / 2;
+	lv_obj_set_x(value, new_vx);
+	position_unit_label(unit, value);
+}
+
+/**
  * @brief Set common screen style (white background)
  */
 static void setup_screen_style(lv_obj_t *scr)
@@ -1231,6 +1252,7 @@ static void build_weather_screen(void)
 	weather_temp_unit = create_label(screen_weather, font_unit, unit_color,
 					 0, 0, "\xC2\xB0""C");
 	position_unit_label(weather_temp_unit, weather_temp_value);
+	center_value_unit(weather_temp_value, weather_temp_unit);
 	y += 42;
 
 	/* HUM label */
@@ -1244,6 +1266,7 @@ static void build_weather_screen(void)
 	weather_hum_unit = create_label(screen_weather, font_unit, unit_color,
 					0, 0, "%");
 	position_unit_label(weather_hum_unit, weather_hum_value);
+	center_value_unit(weather_hum_value, weather_hum_unit);
 	y += 42;
 
 	/* PRESS label */
@@ -1257,6 +1280,7 @@ static void build_weather_screen(void)
 	weather_press_unit = create_label(screen_weather, font_unit, unit_color,
 					  0, 0, "hPa");
 	position_unit_label(weather_press_unit, weather_press_value);
+	center_value_unit(weather_press_value, weather_press_unit);
 }
 
 /**
@@ -1333,14 +1357,17 @@ static void update_weather_display(void)
 	snprintf(buf, sizeof(buf), "%d.%d", temp_int, temp_frac);
 	lv_label_set_text(weather_temp_value, buf);
 	position_unit_label(weather_temp_unit, weather_temp_value);
+	center_value_unit(weather_temp_value, weather_temp_unit);
 
 	snprintf(buf, sizeof(buf), "%d.%d", hum_int, hum_frac);
 	lv_label_set_text(weather_hum_value, buf);
 	position_unit_label(weather_hum_unit, weather_hum_value);
+	center_value_unit(weather_hum_value, weather_hum_unit);
 
 	snprintf(buf, sizeof(buf), "%d", press_int);
 	lv_label_set_text(weather_press_value, buf);
 	position_unit_label(weather_press_unit, weather_press_value);
+	center_value_unit(weather_press_value, weather_press_unit);
 }
 
 /**
