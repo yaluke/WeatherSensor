@@ -129,6 +129,17 @@ static volatile int pending_navigate = 0;
 /* Flag set when D1 pressed — main loop starts provisioning SoftAP. */
 static volatile bool pending_provisioning = false;
 
+/* Software-side hold filter — additional defense against phantom presses
+ * that sneak through the gpio-keys debounce. button_input_cb queues a
+ * delayable work for BUTTON_HOLD_MS; if a release arrives before then,
+ * we cancel the work and the press is dropped. Real human presses last
+ * far longer than BUTTON_HOLD_MS so the work fires and the press is
+ * dispatched as if it had arrived directly. */
+#define BUTTON_HOLD_MS 80
+static int button_pending_code = 0;             /* 0 = nothing pending */
+static void button_hold_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(button_hold_work, button_hold_handler);
+
 /* Flag set by WiFi event handler when AP becomes enabled — main loop
  * assigns the IP address and starts the DHCP server. */
 static volatile bool pending_ap_network_setup = false;
@@ -174,33 +185,58 @@ static void button_input_cb(struct input_event *evt, void *user_data)
 {
 	ARG_UNUSED(user_data);
 
-	LOG_INF("Input event: type=%u code=%u value=%d sync=%u",
-		evt->type, evt->code, evt->value, evt->sync);
-
-	/* Only react to key press (value=1), ignore release (value=0) */
-	if (evt->type != INPUT_EV_KEY || evt->value != 1) {
+	if (evt->type != INPUT_EV_KEY) {
 		return;
 	}
 
-	switch (evt->code) {
-	case INPUT_KEY_0: /* D0 button = UP = next screen */
+	if (evt->value == 1) {
+		/* Press: queue dispatch for BUTTON_HOLD_MS from now. */
+		button_pending_code = (int)evt->code;
+		k_work_reschedule(&button_hold_work, K_MSEC(BUTTON_HOLD_MS));
+	} else {
+		/* Release: if dispatch hasn't fired yet (k_work_cancel_delayable
+		 * returns the prior queued state), the press was too short — drop. */
+		if (button_pending_code == (int)evt->code) {
+			if (k_work_cancel_delayable(&button_hold_work) != 0) {
+				LOG_INF("Phantom press rejected: code=%u",
+					evt->code);
+			}
+			button_pending_code = 0;
+		}
+	}
+}
+INPUT_CALLBACK_DEFINE(NULL, button_input_cb, NULL);
+
+/**
+ * @brief Delayed handler that runs BUTTON_HOLD_MS after a press if it
+ * wasn't cancelled by a quick release. Sets the appropriate pending_*
+ * flag for the main loop to act on.
+ */
+static void button_hold_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	int code = button_pending_code;
+	button_pending_code = 0;
+
+	switch (code) {
+	case INPUT_KEY_0:  /* D0 = UP = next screen */
 		pending_navigate = 1;
 		LOG_INF("Button D0 (UP) pressed");
 		break;
-	case INPUT_KEY_3: /* D2 button = DOWN = previous screen */
+	case INPUT_KEY_3:  /* D2 = DOWN = previous screen */
 		pending_navigate = -1;
 		LOG_INF("Button D2 (DOWN) pressed");
 		break;
-	case INPUT_KEY_1: /* D1 button = SET = start SoftAP provisioning */
+	case INPUT_KEY_1:  /* D1 = SET = start SoftAP provisioning */
 		pending_provisioning = true;
 		LOG_INF("Button D1 (SET) pressed - provisioning requested");
 		break;
 	default:
-		LOG_INF("Unknown button code: %u", evt->code);
+		LOG_INF("Unknown button code: %d", code);
 		break;
 	}
 }
-INPUT_CALLBACK_DEFINE(NULL, button_input_cb, NULL);
 
 /**
  * @brief Navigate to the next or previous screen
