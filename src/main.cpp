@@ -585,7 +585,12 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		wifi_connected = true;
 		pending_wifi_icon_update = true;
-		pending_initial_sync = true;
+		/* Only kick the initial SNTP sync on the first connect.
+		 * Later reassociations would otherwise reset the hourly
+		 * cadence by triggering an unscheduled sync each time. */
+		if (!time_synced) {
+			pending_initial_sync = true;
+		}
 		break;
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
 		LOG_INF("WiFi disconnected");
