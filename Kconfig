@@ -21,4 +21,26 @@ config WEATHER_WIFI_TEST_PSK
 	help
 	  Password for the test SSID above. Leave empty for open networks.
 
+config WEATHER_INFLUX_HOST
+	string "InfluxDB host (LAN IP or hostname)"
+	default "192.168.1.114"
+	help
+	  Plain HTTP InfluxDB 1.x server reachable on the local network.
+	  No TLS, no auth — meant for a LAN-only deployment.
+
+config WEATHER_INFLUX_PORT
+	int "InfluxDB TCP port"
+	default 8086
+
+config WEATHER_INFLUX_DB
+	string "InfluxDB database name"
+	default "weather"
+
+config WEATHER_DEVICE_ID
+	string "Device identifier (used as the 'device' tag)"
+	default "ws01"
+	help
+	  Tag attached to each Influx measurement so multiple sensors can
+	  coexist in the same database without schema changes.
+
 endmenu
