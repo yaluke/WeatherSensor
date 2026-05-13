@@ -43,4 +43,16 @@ config WEATHER_DEVICE_ID
 	  Tag attached to each Influx measurement so multiple sensors can
 	  coexist in the same database without schema changes.
 
+config WEATHER_TEMP_OFFSET_CDEG
+	int "Temperature offset in centi-degrees Celsius (signed)"
+	default 0
+	help
+	  Subtracted from each raw BME280 reading before display and
+	  uplink, to compensate for residual board-conduction self-
+	  heating that remains after switching to forced mode.
+
+	  Centi-degrees C so a value of 75 means subtract 0.75 deg C.
+	  Negative values add to the reading. Default 0 — measure
+	  against a reference thermometer first, then dial in.
+
 endmenu

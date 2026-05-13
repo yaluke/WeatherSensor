@@ -108,3 +108,19 @@
 		};
 	};
 };
+
+/*
+ * Power the external BME280 module's Vcc from GPIO8 (silk: A5).
+ * Hogged HIGH at boot so the Zephyr BME280 driver's POST_KERNEL init —
+ * which talks to the chip over I2C to read calibration coefficients —
+ * sees a powered sensor. Once boot is done, the application toggles
+ * this pin per-read in sensors_read() to keep the chip cold between
+ * minute-spaced samples.
+ */
+&gpio0 {
+	bme280_power_enable {
+		gpio-hog;
+		gpios = <8 GPIO_ACTIVE_HIGH>;
+		output-high;
+	};
+};
