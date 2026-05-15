@@ -12,6 +12,7 @@ project(WeatherSensor)
 target_sources(app PRIVATE
 	src/main.cpp
 	src/battery.cpp
+	src/bme280.cpp
 	src/display.cpp
 )
 
