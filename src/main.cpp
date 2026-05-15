@@ -9,7 +9,6 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/sensor.h>
-#include <zephyr/drivers/fuel_gauge.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
@@ -32,6 +31,7 @@ extern "C" {
 #include <string.h>
 #include <time.h>
 
+#include "battery.h"
 #include "display.h"
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
@@ -95,9 +95,6 @@ static const struct device *bme280;
  * a hook to re-init humidity oversampling per-fetch). */
 static const struct device *i2c_dev;
 
-/* Fuel gauge device */
-static const struct device *fuel_gauge_dev;
-
 /* ========================================================================
  * Sensor data (global, updated by sensors_read())
  * ======================================================================== */
@@ -105,13 +102,6 @@ static const struct device *fuel_gauge_dev;
 static float temperature = 0.0f;
 static float humidity = 0.0f;
 static float pressure = 0.0f;
-
-/* ========================================================================
- * Battery state
- * ======================================================================== */
-
-static bool battery_available = false;
-static uint8_t battery_soc = 100; /* State of charge %, mocked at 100% */
 
 /* ========================================================================
  * UI constants
@@ -428,51 +418,8 @@ static int sensors_read(void)
 }
 
 /* ========================================================================
- * Fuel gauge (battery monitoring)
+ * Battery display helper (moves to ui.cpp in a later commit)
  * ======================================================================== */
-
-/**
- * @brief Initialize the MAX17048 fuel gauge
- *
- * Called after display_power_init() since GPIO7 powers the I2C bus.
- *
- * @return 0 on success, negative errno on failure
- */
-static int fuel_gauge_init_device(void)
-{
-	fuel_gauge_dev = DEVICE_DT_GET_ONE(maxim_max17048);
-
-	if (!device_is_ready(fuel_gauge_dev)) {
-		LOG_WRN("MAX17048: not ready (will use mocked battery)");
-		battery_available = false;
-		return -ENODEV;
-	}
-
-	LOG_INF("MAX17048: Device ready - %s", fuel_gauge_dev->name);
-	battery_available = true;
-	return 0;
-}
-
-/**
- * @brief Read battery state of charge from fuel gauge
- */
-static void battery_read(void)
-{
-	if (!battery_available) {
-		return;
-	}
-
-	union fuel_gauge_prop_val val;
-	int ret = fuel_gauge_get_prop(fuel_gauge_dev,
-				      FUEL_GAUGE_RELATIVE_STATE_OF_CHARGE, &val);
-	if (ret < 0) {
-		LOG_WRN("Failed to read battery SOC: %d", ret);
-		return;
-	}
-
-	battery_soc = val.relative_state_of_charge;
-	LOG_INF("Battery SOC: %u%%", battery_soc);
-}
 
 /**
  * @brief Get the battery symbol based on state of charge
@@ -497,7 +444,7 @@ static const char *battery_symbol(uint8_t soc)
  */
 static void update_battery_display(void)
 {
-	const char *sym = battery_symbol(battery_soc);
+	const char *sym = battery_symbol(battery_get_soc());
 	for (int i = 0; i < NUM_SCREENS; i++) {
 		lv_label_set_text(battery_labels[i], sym);
 	}
@@ -925,7 +872,7 @@ static void influx_capture_sample(void)
 		.temp_c      = temperature,
 		.hum_pct     = humidity,
 		.pres_hpa    = pressure,
-		.battery_pct = battery_available ? (int)battery_soc : -1,
+		.battery_pct = battery_is_available() ? (int)battery_get_soc() : -1,
 	};
 	influx_buf_push(&s);
 	LOG_INF("Influx queued: %u/%u (temp=%.2f hum=%.2f pres=%.2f)",
@@ -1778,7 +1725,7 @@ int main(void)
 	gpio_pin_configure_dt(&bme280_power, GPIO_OUTPUT_INACTIVE);
 
 	/* Initialize fuel gauge (after display power, since GPIO7 powers I2C bus) */
-	ret = fuel_gauge_init_device();
+	ret = battery_init();
 	if (ret < 0) {
 		LOG_WRN("Fuel gauge not available - using mocked battery");
 	}

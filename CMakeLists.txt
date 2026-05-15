@@ -11,6 +11,7 @@ project(WeatherSensor)
 # Use LVGL version
 target_sources(app PRIVATE
 	src/main.cpp
+	src/battery.cpp
 	src/display.cpp
 )
 
