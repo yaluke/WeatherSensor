@@ -15,6 +15,7 @@ target_sources(app PRIVATE
 	src/bme280.cpp
 	src/display.cpp
 	src/influx.cpp
+	src/provisioning.cpp
 	src/sntp_sync.cpp
 	src/wifi_sta.cpp
 )
