@@ -17,6 +17,7 @@ target_sources(app PRIVATE
 	src/influx.cpp
 	src/provisioning.cpp
 	src/sntp_sync.cpp
+	src/ui.cpp
 	src/wifi_sta.cpp
 )
 
