@@ -14,6 +14,7 @@ target_sources(app PRIVATE
 	src/battery.cpp
 	src/bme280.cpp
 	src/display.cpp
+	src/sntp_sync.cpp
 )
 
 target_include_directories(app PRIVATE inc)

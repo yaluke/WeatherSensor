@@ -18,7 +18,6 @@ extern "C" {
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/net/socket.h>
-#include <zephyr/net/sntp.h>
 }
 
 #include <errno.h>
@@ -31,6 +30,7 @@ extern "C" {
 #include "battery.h"
 #include "bme280.h"
 #include "display.h"
+#include "sntp_sync.h"
 
 LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
@@ -73,8 +73,8 @@ static lv_obj_t *weather_hum_unit;
 static lv_obj_t *weather_press_value;
 static lv_obj_t *weather_press_unit;
 
-/* Drift screen labels — one row per ring slot, plus a header. */
-#define DRIFT_HISTORY_SIZE 8
+/* Drift screen labels — one row per ring slot, plus a header.
+ * DRIFT_HISTORY_SIZE is shared with the SNTP module via app_state.h. */
 static lv_obj_t *drift_title_label;
 static lv_obj_t *drift_row_labels[DRIFT_HISTORY_SIZE];
 
@@ -111,33 +111,6 @@ static volatile bool pending_ap_network_setup = false;
 /* Tracked by WiFi event handler; main loop pushes it to the LVGL icon. */
 static volatile bool wifi_connected = false;
 static volatile bool pending_wifi_icon_update = false;
-
-/* SNTP time-of-day sync state.
- * - time_synced: false until the first successful sync; until then the time
- *   display falls back to uptime so the screen isn't blank at boot.
- * - seconds_since_last_sync: counts main-loop ticks since the last successful
- *   sync; main loop triggers a re-sync when it crosses TIME_SYNC_INTERVAL_S.
- * - pending_initial_sync: set by the WiFi connect event handler so the very
- *   first sync runs as soon as we have an IP, not on a fixed cadence boundary.
- */
-static bool time_synced = false;
-static uint32_t seconds_since_last_sync = 0;
-static volatile bool pending_initial_sync = false;
-
-/* Ring buffer of recent SNTP drift measurements (last DRIFT_HISTORY_SIZE
- * comparisons; the very first sync is excluded — there's nothing to
- * compare it against). Written by sntp_sync_time() and read by
- * update_drift_display() in the main loop. */
-struct drift_entry {
-	int64_t drift_ms;
-	uint32_t interval_s;
-	struct tm local_tm;
-	bool valid;
-};
-static struct drift_entry drift_history[DRIFT_HISTORY_SIZE];
-static int drift_head = 0;  /* next slot to overwrite */
-static volatile bool pending_drift_screen_update = false;
-
 
 /**
  * @brief Input event callback for hardware buttons
@@ -350,8 +323,8 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		/* Only kick the initial SNTP sync on the first connect.
 		 * Later reassociations would otherwise reset the hourly
 		 * cadence by triggering an unscheduled sync each time. */
-		if (!time_synced) {
-			pending_initial_sync = true;
+		if (!sntp_is_synced()) {
+			sntp_request_initial_sync();
 		}
 		break;
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
@@ -394,76 +367,6 @@ static int wifi_connect(const char *ssid, const char *psk)
 		LOG_ERR("WiFi connect request failed: %d", ret);
 	}
 	return ret;
-}
-
-/* ========================================================================
- * SNTP wall-clock sync
- * ========================================================================
- *
- * sntp_simple() blocks for up to its timeout (5 s here) including DNS
- * resolution. That's an acceptable stall for a 1-hour cadence — never
- * during user interaction — so we run it inline from the main loop
- * rather than spawning a workqueue.
- */
-
-#define SNTP_SERVER             "pool.ntp.org"
-#define SNTP_TIMEOUT_MS         5000
-#define TIME_SYNC_INTERVAL_S    3600  /* 1 hour */
-
-/* Convert an SNTP fractional-second value (Q32.32 fixed-point) to nanoseconds. */
-static inline uint32_t sntp_fraction_to_ns(uint64_t fraction)
-{
-	return (uint32_t)((fraction * NSEC_PER_SEC) >> 32);
-}
-
-static int sntp_sync_time(void)
-{
-	struct sntp_time st;
-	int ret = sntp_simple(SNTP_SERVER, SNTP_TIMEOUT_MS, &st);
-	if (ret < 0) {
-		LOG_WRN("SNTP sync failed: %d (keeping previous time)", ret);
-		return ret;
-	}
-
-	struct timespec new_ts = {
-		.tv_sec  = (time_t)st.seconds,
-		.tv_nsec = sntp_fraction_to_ns(st.fraction),
-	};
-
-	if (time_synced) {
-		struct timespec before;
-		clock_gettime(CLOCK_REALTIME, &before);
-		int64_t before_ms = (int64_t)before.tv_sec * 1000 +
-				    before.tv_nsec / 1000000;
-		int64_t new_ms    = (int64_t)new_ts.tv_sec * 1000 +
-				    new_ts.tv_nsec / 1000000;
-		int64_t drift_ms  = before_ms - new_ms;
-		LOG_INF("SNTP synced: drift = %+lld ms over %u s",
-			(long long)drift_ms, seconds_since_last_sync);
-
-		struct drift_entry *slot = &drift_history[drift_head];
-		slot->drift_ms = drift_ms;
-		slot->interval_s = seconds_since_last_sync;
-		localtime_r(&new_ts.tv_sec, &slot->local_tm);
-		slot->valid = true;
-		drift_head = (drift_head + 1) % DRIFT_HISTORY_SIZE;
-		pending_drift_screen_update = true;
-	} else {
-		struct tm utc;
-		gmtime_r(&new_ts.tv_sec, &utc);
-		LOG_INF("SNTP synced: initial value %04d-%02d-%02d %02d:%02d:%02d UTC",
-			utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-			utc.tm_hour, utc.tm_min, utc.tm_sec);
-	}
-
-	if (clock_settime(CLOCK_REALTIME, &new_ts) < 0) {
-		LOG_ERR("clock_settime failed: %d", errno);
-		return -errno;
-	}
-
-	time_synced = true;
-	seconds_since_last_sync = 0;
-	return 0;
 }
 
 /* ========================================================================
@@ -658,7 +561,8 @@ static void influx_drain(void)
 }
 
 /* Capture the current sensor state into a sample for the ring buffer.
- * Only call when time_synced is true so timestamps are real wall-clock. */
+ * Only call when sntp_is_synced() is true so timestamps are real
+ * wall-clock. */
 static void influx_capture_sample(void)
 {
 	struct timespec ts;
@@ -1389,7 +1293,7 @@ static bool minute_boundary_fired(void)
 	static int last_minute_fired = -1;
 	int minute_now;
 
-	if (time_synced) {
+	if (sntp_is_synced()) {
 		struct timespec ts;
 		struct tm local;
 		clock_gettime(CLOCK_REALTIME, &ts);
@@ -1425,7 +1329,7 @@ static void update_time_display(void)
 {
 	char time_str[16];
 
-	if (time_synced) {
+	if (sntp_is_synced()) {
 		struct timespec ts;
 		struct tm local;
 		clock_gettime(CLOCK_REALTIME, &ts);
@@ -1450,9 +1354,11 @@ static void update_time_display(void)
  */
 static void update_drift_display(void)
 {
+	drift_entry_t snapshot[DRIFT_HISTORY_SIZE];
+	sntp_drift_snapshot(snapshot);
+
 	for (int i = 0; i < DRIFT_HISTORY_SIZE; i++) {
-		int idx = (drift_head + i) % DRIFT_HISTORY_SIZE;
-		const struct drift_entry *e = &drift_history[idx];
+		const drift_entry_t *e = &snapshot[i];
 		char row[32];
 
 		if (e->valid) {
@@ -1630,21 +1536,17 @@ int main(void)
 
 		/* New SNTP drift sample arrived — repaint the drift screen.
 		 * Cheap; LVGL only redraws the active screen. */
-		if (pending_drift_screen_update) {
-			pending_drift_screen_update = false;
+		if (sntp_take_pending_drift_update()) {
 			update_drift_display();
 		}
 
 		/* SNTP wall-clock sync: first sync as soon as WiFi is up,
-		 * then every TIME_SYNC_INTERVAL_S after a successful sync.
-		 * sntp_sync_time() blocks for up to SNTP_TIMEOUT_MS — fine
-		 * at this cadence. */
-		if (pending_initial_sync) {
-			pending_initial_sync = false;
-			sntp_sync_time();
-		} else if (wifi_connected && time_synced &&
-			   seconds_since_last_sync >= TIME_SYNC_INTERVAL_S) {
-			sntp_sync_time();
+		 * then every hour after a successful sync. sntp_sync_now()
+		 * blocks for up to a few seconds — fine at this cadence. */
+		if (sntp_take_pending_initial_sync()) {
+			sntp_sync_now();
+		} else if (wifi_connected && sntp_should_resync()) {
+			sntp_sync_now();
 		}
 
 		/* Once per minute, aligned to the wall-clock minute start
@@ -1662,7 +1564,7 @@ int main(void)
 				 * Only when SNTP has set the wall clock — every
 				 * row carries a real timestamp, no server-side
 				 * "receive time" mess. */
-				if (time_synced) {
+				if (sntp_is_synced()) {
 					influx_capture_sample();
 				}
 			}
@@ -1690,7 +1592,7 @@ int main(void)
 		/* Sleep for 1 second */
 		k_msleep(1000);
 		seconds_counter++;
-		seconds_since_last_sync++;
+		sntp_tick();
 	}
 
 	return 0;
