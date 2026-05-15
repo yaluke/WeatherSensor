@@ -103,7 +103,7 @@ void bme280_pin_release_to_runtime(void)
 	gpio_pin_configure_dt(&bme280_power, GPIO_OUTPUT_INACTIVE);
 }
 
-int bme280_read(void)
+int bme280_read(void (*while_bus_up)(void))
 {
 	struct sensor_value val;
 	int ret;
@@ -172,6 +172,14 @@ int bme280_read(void)
 		pressure = sensor_value_to_float(&val) * 10.0f;  /* kPa to hPa */
 		LOG_INF("BME280: Pressure = %.2f hPa (val1=%d val2=%d)",
 			(double)pressure, val.val1, val.val2);
+	}
+
+	/* Piggy-back any other I2C0 traffic the caller wants to do while
+	 * the bus is still alive (typically the fuel-gauge poll). Runs
+	 * even on sample_fetch failure — those failures are confined to
+	 * the BME280 chip, the bus itself is fine. */
+	if (while_bus_up) {
+		while_bus_up();
 	}
 
 	/* Park SDA/SCL at GND first, then cut Vcc. With Vcc still applied,

@@ -44,10 +44,17 @@ int bme280_init(void);
 void bme280_pin_release_to_runtime(void);
 
 /* Full minute-tick read: power up, recover bus, re-arm CTRL_HUM,
- * forced-mode sample_fetch, park lines LOW, power down. Returns 0
- * even if the sample_fetch errored (so the main loop keeps ticking);
- * sub-step failures are LOG_WRN/LOG_ERR. */
-int bme280_read(void);
+ * forced-mode sample_fetch, optionally run a piggy-back callback
+ * while the bus is still alive, then park lines LOW, power down.
+ *
+ * The `while_bus_up` hook exists for other I2C0 devices (battery
+ * fuel gauge etc.) so they get a brief window with a non-parked bus
+ * without each owning their own wake/park sequence. Pass NULL when
+ * there's no piggy-back work.
+ *
+ * Returns 0 even if the sample_fetch errored (so the main loop keeps
+ * ticking); sub-step failures are LOG_WRN/LOG_ERR. */
+int bme280_read(void (*while_bus_up)(void));
 
 /* Most-recent readings cached by bme280_read. Temperature has the
  * CONFIG_WEATHER_TEMP_OFFSET_CDEG offset already applied; pressure is

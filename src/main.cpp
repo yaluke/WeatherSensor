@@ -25,6 +25,16 @@ LOG_MODULE_REGISTER(weather_sensor, LOG_LEVEL_INF);
 
 static uint32_t seconds_counter = 0;
 
+/* Piggy-back hook for bme280_read: refresh the battery state-of-charge
+ * and its status-bar symbol while the I2C0 bus is still alive. Keeps
+ * the MAX17048 off the bus during the windows when bme280_read parks
+ * SDA/SCL low. */
+static void refresh_battery(void)
+{
+	battery_read();
+	ui_update_battery(battery_get_soc());
+}
+
 /* Returns true at most once per wall-clock minute, on the boundary.
  *
  * After SNTP has set the clock we use tm_min from local time; before
@@ -126,16 +136,18 @@ int main(void)
 	/* Initialize LVGL multi-screen UI */
 	ui_init();
 
-	/* Initial sensor read if sensors available */
+	/* Initial sensor read if sensors available. Piggy-back the
+	 * battery poll so it gets the I2C bus while it's still up. */
 	if (sensors_ok) {
 		LOG_INF("Performing initial sensor read...");
-		bme280_read();
+		bme280_read(refresh_battery);
 		ui_update_sensor_display();
+	} else {
+		/* No BME280 — battery still wants to be read. The bus is
+		 * idle (no park-low cycle without bme280_read), so it's
+		 * safe to talk to MAX17048 directly. */
+		refresh_battery();
 	}
-
-	/* Initial battery read */
-	battery_read();
-	ui_update_battery(battery_get_soc());
 
 	/* Mount NVS + register net_mgmt callback, then try to connect.
 	 * Priority: stored NVS credentials > Kconfig test credentials.
@@ -219,7 +231,10 @@ int main(void)
 			if (sensors_ok) {
 				LOG_INF("======== PERIODIC SENSOR READ (t=%us) ========",
 					seconds_counter);
-				bme280_read();
+				/* Piggy-back the battery read inside the
+				 * bme280 bus-up window so it doesn't try to
+				 * talk to MAX17048 while SDA/SCL are parked. */
+				bme280_read(refresh_battery);
 				ui_update_sensor_display();
 				/* Queue this reading for the InfluxDB uplink.
 				 * Only when SNTP has set the wall clock — every
@@ -234,12 +249,6 @@ int main(void)
 		/* Drain pending Influx samples — cheap when the buffer is
 		 * empty, retries from the oldest unsent reading on failure. */
 		influx_drain(wifi_is_connected());
-
-		/* Read battery every 60 seconds */
-		if (seconds_counter % 60 == 0) {
-			battery_read();
-			ui_update_battery(battery_get_soc());
-		}
 
 		/* Log status every 30 seconds */
 		if (seconds_counter % 30 == 0) {
