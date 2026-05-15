@@ -9,7 +9,10 @@ project(WeatherSensor)
 # target_sources(app PRIVATE src/main_simple.cpp)
 
 # Use LVGL version
-target_sources(app PRIVATE src/main.cpp)
+target_sources(app PRIVATE
+	src/main.cpp
+	src/display.cpp
+)
 
 target_include_directories(app PRIVATE inc)
 
