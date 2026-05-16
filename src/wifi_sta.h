@@ -75,6 +75,18 @@ bool wifi_take_pending_icon_update(void);
  * callback. */
 bool wifi_take_pending_ap_setup(void);
 
+/* Raised inside the event handler on every successful STA connect so
+ * the main loop can issue NET_REQUEST_WIFI_PS to enable modem-sleep.
+ * The driver maps WIFI_PS_ENABLED to esp_wifi_set_ps(WIFI_PS_MAX_MODEM)
+ * which roughly halves WiFi idle current. Called from the main loop
+ * because net_mgmt requests inside the event callback aren't safe. */
+bool wifi_take_pending_ps_enable(void);
+
+/* Synchronous net_mgmt(NET_REQUEST_WIFI_PS) wrapper. Caller is the
+ * main loop after wifi_take_pending_ps_enable returns true. Logs the
+ * result at INFO. */
+int wifi_enable_power_save(void);
+
 #ifdef __cplusplus
 }
 #endif

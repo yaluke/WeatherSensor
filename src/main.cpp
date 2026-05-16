@@ -149,6 +149,12 @@ int main(void)
 		refresh_battery();
 	}
 
+	/* Drop the display dark by default. The chip / LVGL got fully
+	 * bootstrapped above so the screen is correctly populated;
+	 * display_sleep just cuts backlight + GPIO7. Any button press
+	 * wakes it for 30 s via ui's input handler. */
+	display_sleep();
+
 	/* Mount NVS + register net_mgmt callback, then try to connect.
 	 * Priority: stored NVS credentials > Kconfig test credentials.
 	 * If Kconfig credentials connect successfully, they're saved to NVS
@@ -205,6 +211,13 @@ int main(void)
 		/* WiFi status-bar icon repaint */
 		if (wifi_take_pending_icon_update()) {
 			ui_update_wifi_icon(wifi_is_connected());
+		}
+
+		/* Enable WiFi modem-sleep after the connect event lands. The
+		 * event handler can't issue net_mgmt requests itself, so the
+		 * flag is set there and the actual call happens here. */
+		if (wifi_take_pending_ps_enable()) {
+			wifi_enable_power_save();
 		}
 
 		/* New SNTP drift sample arrived — repaint the drift screen.

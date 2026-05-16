@@ -8,6 +8,7 @@
 #include "app_state.h"      /* DRIFT_HISTORY_SIZE, drift_entry_t */
 #include "battery.h"
 #include "bme280.h"
+#include "display.h"
 #include "provisioning.h"
 #include "sntp_sync.h"
 
@@ -73,6 +74,44 @@ static int button_pending_code = 0;
 static void button_hold_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(button_hold_work, button_hold_handler);
 
+/* Display-on timeout: the display goes dark after this many ms of no
+ * button activity. Any press extends the timer. */
+#define DISPLAY_ON_TIMEOUT_MS (30 * 1000)
+static void display_off_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(display_off_work, display_off_handler);
+
+/* "This press just woke the display — suppress its normal action."
+ * Set in button_input_cb when a press arrives while the display is
+ * off, consumed by button_hold_handler. Keeps wake-from-dark from
+ * accidentally triggering provisioning or screen navigation. */
+static volatile bool button_wakes_display_only = false;
+
+/* Raised in button_input_cb after display_resume, consumed by the
+ * main loop's first ui_tick after wake. The main loop owns LVGL —
+ * we keep lv_obj_invalidate + lv_timer_handler off the input
+ * subsystem thread. */
+static volatile bool pending_invalidate_after_wake = false;
+
+static void display_off_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	display_sleep();
+}
+
+/* Helper called from button_input_cb and (optionally) from main.cpp
+ * to bring the display back from sleep and (re-)arm the timeout.
+ * Runs from input subsystem thread context. */
+static void wake_display_and_arm_timeout(void)
+{
+	if (!display_is_on()) {
+		display_resume();
+		/* Defer the LVGL invalidate to the main loop — LVGL is not
+		 * thread-safe and we're on the input thread here. */
+		pending_invalidate_after_wake = true;
+	}
+	k_work_reschedule(&display_off_work, K_MSEC(DISPLAY_ON_TIMEOUT_MS));
+}
+
 static void button_input_cb(struct input_event *evt, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -82,6 +121,16 @@ static void button_input_cb(struct input_event *evt, void *user_data)
 	}
 
 	if (evt->value == 1) {
+		/* Any press wakes the display (if dark) and extends the
+		 * 30s timeout. If the display was off, mark the press
+		 * "wake only" so the hold-handler suppresses its normal
+		 * action — otherwise pressing D1 to wake would also fire
+		 * provisioning. */
+		if (!display_is_on()) {
+			button_wakes_display_only = true;
+		}
+		wake_display_and_arm_timeout();
+
 		/* Press: queue dispatch for BUTTON_HOLD_MS from now. */
 		button_pending_code = (int)evt->code;
 		k_work_reschedule(&button_hold_work, K_MSEC(BUTTON_HOLD_MS));
@@ -105,6 +154,15 @@ static void button_hold_handler(struct k_work *work)
 
 	int code = button_pending_code;
 	button_pending_code = 0;
+
+	/* If this press was responsible for waking the display, swallow
+	 * its normal action — the user just wanted the screen on. The
+	 * 30s timeout has already been armed. */
+	if (button_wakes_display_only) {
+		button_wakes_display_only = false;
+		LOG_INF("Button %d swallowed (display wake only)", code);
+		return;
+	}
 
 	switch (code) {
 	case INPUT_KEY_0:  /* D0 = UP = next screen */
@@ -476,5 +534,20 @@ void ui_update_wifi_icon(bool connected)
 
 void ui_tick(void)
 {
+	/* Skip the LVGL flush when the display is off — every widget
+	 * update remains in LVGL's in-RAM state and will paint cleanly
+	 * once the display wakes (we invalidate the active screen on
+	 * resume to force a full redraw). This avoids needless SPI
+	 * traffic to a chip whose Vcc is cut. */
+	if (!display_is_on()) {
+		return;
+	}
+	/* First tick after a wake: invalidate the active screen so LVGL
+	 * does a full redraw, not just dirty regions (the controller's
+	 * frame buffer came back as garbage post-Vcc-cycle). */
+	if (pending_invalidate_after_wake) {
+		pending_invalidate_after_wake = false;
+		lv_obj_invalidate(lv_screen_active());
+	}
 	lv_timer_handler();
 }

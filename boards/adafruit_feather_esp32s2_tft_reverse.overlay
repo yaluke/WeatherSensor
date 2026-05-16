@@ -6,6 +6,16 @@
  * Uses UART0 on GPIO43/44 (DB pin) for console instead of GPIO1/2
  */
 
+/*
+ * Drop CPU from 240 MHz to 160 MHz to cut active-current draw. The
+ * Zephyr-side esp32 module derives CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+ * from this DT property. App is I/O-bound so the wall-clock impact
+ * is negligible.
+ */
+&cpu0 {
+	clock-frequency = <DT_FREQ_M(160)>;
+};
+
 /* Enable ST7789V TFT Display */
 &st7789v_tft {
 	status = "okay";

@@ -35,6 +35,7 @@ static struct net_mgmt_event_callback wifi_mgmt_cb;
 static volatile bool wifi_connected = false;
 static volatile bool pending_wifi_icon_update = false;
 static volatile bool pending_ap_network_setup = false;
+static volatile bool pending_ps_enable = false;
 
 /* When credentials come from Kconfig and WiFi connects, save them to NVS
  * so the next boot auto-connects without rebuilding. */
@@ -117,6 +118,12 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		wifi_connected = true;
 		pending_wifi_icon_update = true;
+		/* Enable modem-sleep on every (re)connect. Deferred to the
+		 * main loop because net_mgmt requests must not run inside an
+		 * event callback. Re-arming on every reconnect is cheap and
+		 * makes sure roaming or temporary deassociation doesn't leave
+		 * us at full power. */
+		pending_ps_enable = true;
 		/* Only kick the initial SNTP sync on the first connect.
 		 * Later reassociations would otherwise reset the hourly
 		 * cadence by triggering an unscheduled sync each time. */
@@ -205,4 +212,34 @@ bool wifi_take_pending_ap_setup(void)
 		return true;
 	}
 	return false;
+}
+
+bool wifi_take_pending_ps_enable(void)
+{
+	if (pending_ps_enable) {
+		pending_ps_enable = false;
+		return true;
+	}
+	return false;
+}
+
+int wifi_enable_power_save(void)
+{
+	struct net_if *iface = net_if_get_default();
+	struct wifi_ps_params params = {};
+
+	/* Driver only branches on .enabled; .mode/.listen_interval are
+	 * passed through but the esp32 driver hardcodes WIFI_PS_MAX_MODEM
+	 * once .enabled == WIFI_PS_ENABLED. Keep the other fields at their
+	 * defaults. */
+	params.enabled = WIFI_PS_ENABLED;
+	params.type = WIFI_PS_PARAM_STATE;
+
+	int ret = net_mgmt(NET_REQUEST_WIFI_PS, iface, &params, sizeof(params));
+	if (ret < 0) {
+		LOG_WRN("WiFi PS enable failed: %d", ret);
+		return ret;
+	}
+	LOG_INF("WiFi PS enabled (modem-sleep)");
+	return 0;
 }
