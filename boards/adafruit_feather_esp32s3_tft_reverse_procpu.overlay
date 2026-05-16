@@ -1,0 +1,114 @@
+/*
+ * Copyright (c) 2026 Lukasz Ronka
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Overlay for ESP32-S3 Reverse TFT Feather.
+ *
+ * Mirrors the ESP32-S2 overlay with these differences:
+ *   - Console stays on USB-CDC (upstream default — &usb_serial). No
+ *     ESP-Prog needed; logs come out the USB-C port.
+ *   - Three buttons (button0/1/2) instead of two (d1/d2). The upstream
+ *     DTS sets all three to GPIO_PULL_UP | GPIO_ACTIVE_LOW, but the
+ *     Reverse-line hardware actually wires them the opposite way (pulled
+ *     LOW, go HIGH on press) — same as on -S2.
+ *   - MAX17048 is enabled in the board DTS by default; we don't need
+ *     to repeat the override here.
+ *   - i2c_reg power domain is already declared in the board DTS for
+ *     STEMMA + display Vcc, but PM is disabled in prj.conf so the
+ *     power-domain-gpio driver isn't actually doing anything. Our
+ *     display.cpp toggles GPIO7 by hand.
+ *
+ * Everything I2C-side (GPIO3/4 SDA/SCL, internal pull-up override,
+ * BME280 child node) and the GPIO8 hog for the external BME280 Vcc
+ * transfer verbatim from -S2.
+ */
+
+/*
+ * Drop CPU from 240 MHz to 160 MHz. ESP32-S3 supports the same set of
+ * CPU frequencies as -S2 (240 / 160 / 80 / 40 / 2 MHz); the Zephyr-side
+ * esp32 module Kconfig recognizes 96 / 120 / 160 / 240 so 160 is the
+ * floor that doesn't trip the clock-tick scaling math.
+ */
+&cpu0 {
+	clock-frequency = <DT_FREQ_M(160)>;
+};
+
+/* Enable ST7789V TFT Display (upstream leaves it status = "disabled") */
+&st7789v_tft {
+	status = "okay";
+};
+
+/* Override I2C0 pinctrl to enable internal pull-ups (matches -S2 — the
+ * upstream pinctrl declares drive-open-drain + output-high but no
+ * bias-pull-up, and the BME280 module relies on these pulls). */
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO3>,
+				 <I2C0_SCL_GPIO4>;
+			drive-open-drain;
+			bias-pull-up;
+		};
+	};
+};
+
+/* Add the BME280 child to the upstream-enabled I2C0 node. */
+&i2c0 {
+	bme280@77 {
+		compatible = "bosch,bme280";
+		reg = <0x77>;
+		status = "okay";
+	};
+};
+
+/* Enable WiFi driver (still WiFi+Influx in Phase 2 — BLE swap is Phase 3). */
+&wifi {
+	status = "okay";
+};
+
+/*
+ * Fix D0/D1/D2 button polarity. Upstream DTS sets all three to
+ * GPIO_PULL_UP | GPIO_ACTIVE_LOW but the Reverse-line hardware actually
+ * pulls them LOW by default and they go HIGH on press. Same fix as
+ * -S2, just three buttons instead of two.
+ *
+ * Also override zephyr,code on D2 from INPUT_KEY_2 → INPUT_KEY_3 so
+ * the application's switch (which was written against the -S2
+ * upstream code mapping where D2 = INPUT_KEY_3) sees the same codes
+ * on both boards. D0 and D1 codes already match.
+ *
+ * 100 ms debounce at the gpio-keys driver level — matches -S2's
+ * "second phantom press slipped through after 50 ms" tuning. The app
+ * adds another 80 ms hold filter in button_input_cb on top.
+ */
+/ {
+	gpio_keys {
+		debounce-interval-ms = <100>;
+
+		button0: button_0 {
+			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
+		};
+		button1: button_1 {
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+		};
+		button2: button_2 {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+			zephyr,code = <INPUT_KEY_3>;
+		};
+	};
+};
+
+/*
+ * Power the external BME280 module's Vcc from GPIO8 (silk: A5).
+ * Hogged HIGH at boot so the Zephyr BME280 driver's POST_KERNEL init
+ * sees a powered sensor. Once boot is done, the application toggles
+ * this pin per-read in sensors_read() to keep the chip cold between
+ * minute-spaced samples — same dance as -S2.
+ */
+&gpio0 {
+	bme280_power_enable {
+		gpio-hog;
+		gpios = <8 GPIO_ACTIVE_HIGH>;
+		output-high;
+	};
+};
