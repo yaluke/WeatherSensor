@@ -207,6 +207,13 @@ int main(void)
 			ui_update_wifi_icon(wifi_is_connected());
 		}
 
+		/* Enable WiFi modem-sleep after the connect event lands. The
+		 * event handler can't issue net_mgmt requests itself, so the
+		 * flag is set there and the actual call happens here. */
+		if (wifi_take_pending_ps_enable()) {
+			wifi_enable_power_save();
+		}
+
 		/* New SNTP drift sample arrived — repaint the drift screen.
 		 * Cheap; LVGL only redraws the active screen. */
 		if (sntp_take_pending_drift_update()) {
