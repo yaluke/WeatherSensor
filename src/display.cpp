@@ -26,6 +26,12 @@ static const struct gpio_dt_spec backlight =
  * pointer once init is done. */
 static const struct device *display_dev;
 
+/* Tracks whether the display rail + backlight are currently on. Used
+ * to make display_sleep / display_resume idempotent. Initialized true
+ * by the boot sequence (display_power_init → display_init →
+ * backlight_init). */
+static bool display_on = false;
+
 int display_power_init(void)
 {
 	int ret;
@@ -68,7 +74,59 @@ int backlight_init(void)
 	gpio_pin_set_dt(&backlight, 1);
 	LOG_INF("Backlight enabled (GPIO%d)", backlight.pin);
 
+	display_on = true;
 	return 0;
+}
+
+void display_sleep(void)
+{
+	if (!display_on) {
+		return;
+	}
+
+	/* Backlight off first — kills the visible image instantly.
+	 * Dropping GPIO7 (display rail) before would briefly show the
+	 * frame buffer fading as the controller loses power. */
+	gpio_pin_set_dt(&backlight, 0);
+	gpio_pin_set_dt(&display_power, 0);
+
+	display_on = false;
+	LOG_INF("Display off");
+}
+
+int display_resume(void)
+{
+	if (display_on) {
+		return 0;
+	}
+
+	int ret;
+
+	gpio_pin_set_dt(&display_power, 1);
+	/* ST7789V needs time for the rail to settle + internal POR. */
+	k_msleep(10);
+
+	/* The chip lost state with Vcc — re-issue display_blanking_off
+	 * so the controller comes back up in the right mode. The Zephyr
+	 * device binding survives, only the chip-side state needs to be
+	 * rebuilt. */
+	ret = display_blanking_off(display_dev);
+	if (ret < 0) {
+		LOG_ERR("display_resume: blanking_off failed: %d", ret);
+		gpio_pin_set_dt(&display_power, 0);
+		return ret;
+	}
+
+	gpio_pin_set_dt(&backlight, 1);
+
+	display_on = true;
+	LOG_INF("Display on");
+	return 0;
+}
+
+bool display_is_on(void)
+{
+	return display_on;
 }
 
 int display_init(void)

@@ -149,6 +149,12 @@ int main(void)
 		refresh_battery();
 	}
 
+	/* Drop the display dark by default. The chip / LVGL got fully
+	 * bootstrapped above so the screen is correctly populated;
+	 * display_sleep just cuts backlight + GPIO7. Any button press
+	 * wakes it for 30 s via ui's input handler. */
+	display_sleep();
+
 	/* Mount NVS + register net_mgmt callback, then try to connect.
 	 * Priority: stored NVS credentials > Kconfig test credentials.
 	 * If Kconfig credentials connect successfully, they're saved to NVS
