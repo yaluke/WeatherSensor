@@ -38,6 +38,23 @@
 	status = "okay";
 };
 
+/*
+ * Override console from &usb_serial → &uart0 so ESP-Prog (wired to
+ * GPIO43/44 = DB pin, same as -S2) captures every log line from the
+ * very first Zephyr boot message. USB-SERIAL-JTAG works but enumerates
+ * a few hundred ms after firmware starts — early panics get lost.
+ *
+ * UART0 on -S3 uses GPIO43/44 same as -S2, so the ESP-Prog wiring is
+ * identical between boards. Trade-off: the USB-C native console goes
+ * silent (you can flip the priority by reverting this block).
+ */
+/ {
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+};
+
 /* Override I2C0 pinctrl to enable internal pull-ups (matches -S2 — the
  * upstream pinctrl declares drive-open-drain + output-high but no
  * bias-pull-up, and the BME280 module relies on these pulls). */
@@ -67,15 +84,21 @@
 };
 
 /*
- * Fix D0/D1/D2 button polarity. Upstream DTS sets all three to
- * GPIO_PULL_UP | GPIO_ACTIVE_LOW but the Reverse-line hardware actually
- * pulls them LOW by default and they go HIGH on press. Same fix as
- * -S2, just three buttons instead of two.
+ * Fix button polarity on D1 and D2. The Reverse-line hardware wires
+ * D1 (GPIO1) and D2 (GPIO2) so they're pulled LOW by default and go
+ * HIGH on press, which is opposite to the upstream DTS's
+ * GPIO_PULL_UP | GPIO_ACTIVE_LOW. Same fix as -S2.
+ *
+ * D0 is different: GPIO0 is the ESP32-S3 chip's boot-mode strap pin
+ * with an external pull-up that the bootloader relies on. The
+ * D0 user-button hangs off that strap, so it really IS pulled HIGH
+ * by default and goes LOW when pressed — the upstream
+ * GPIO_PULL_UP | GPIO_ACTIVE_LOW is correct for D0. Don't override.
  *
  * Also override zephyr,code on D2 from INPUT_KEY_2 → INPUT_KEY_3 so
- * the application's switch (which was written against the -S2
+ * the application's switch (originally written against -S2's
  * upstream code mapping where D2 = INPUT_KEY_3) sees the same codes
- * on both boards. D0 and D1 codes already match.
+ * on both boards.
  *
  * 100 ms debounce at the gpio-keys driver level — matches -S2's
  * "second phantom press slipped through after 50 ms" tuning. The app
@@ -85,9 +108,6 @@
 	gpio_keys {
 		debounce-interval-ms = <100>;
 
-		button0: button_0 {
-			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
-		};
 		button1: button_1 {
 			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
 		};
