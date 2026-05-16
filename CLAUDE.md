@@ -19,18 +19,36 @@ Initial development - basic time display with UART console logging. Sensors, net
 
 ## Hardware Platform
 
-**Board:** Adafruit Feather ESP32-S2 **Reverse** TFT ⚠️
-- **MCU:** ESP32-S2 (Xtensa LX7 single-core @ 240MHz)
-- **RAM:** 320 KB SRAM
+The application builds for two boards in the same Feather form factor.
+Both share the 1.14" 135x240 ST7789V TFT, MAX17048 fuel gauge, and the
+same I2C0 pinout (GPIO3/4) + GPIO7 i2c_reg + GPIO45 backlight + GPIO8
+A5/BME280-Vcc. Pick the target that matches the board on your desk.
+
+**Default board (Phase 2 forward): Adafruit Feather ESP32-S3 Reverse TFT**
+
+- **MCU:** ESP32-S3 (Xtensa LX7 dual-core, throttled to 160 MHz in our overlay)
+- **RAM:** 512 KB SRAM + 2 MB PSRAM
 - **Display:** Built-in 1.14" TFT, 135x240 pixels (ST7789V controller)
-- **Connectivity:** Wi-Fi 802.11 b/g/n (no Bluetooth)
+- **Connectivity:** Wi-Fi 802.11 b/g/n + **BLE 5.0** (the reason we're here)
 - **Power:** Li-Ion battery support with charging circuit
-- **Sensors (future):** Temperature/Pressure/Humidity/Air Quality via SPI
-- **Debug:** UART console via **GPIO43/44 (DB pin)** - NOT GPIO1/2!
-  - **CRITICAL:** GPIO1/GPIO2 are BUTTONS on Reverse board, not UART!
-  - **IMPORTANT:** USB-CDC is NOT supported in Zephyr for ESP32-S2
-  - USB-C port only provides power and flashing capability
-  - Console logs require external USB-to-UART adapter (ESP-Prog recommended)
+- **Buttons:** D0/D1/D2 on GPIO0/1/2 (Reverse-line polarity quirk: pulled LOW,
+  go HIGH on press — overlay fixes the upstream DTS)
+- **Debug:** Console over **USB-CDC on the USB-C port**. No ESP-Prog needed,
+  just open a serial terminal on whatever `/dev/cu.usbmodem*` appears when
+  you plug the board in.
+
+**Fallback board: Adafruit Feather ESP32-S2 Reverse TFT**
+
+Still buildable for testing the WiFi+Influx pipeline against the original
+hardware. Same overlays live side-by-side under `boards/`.
+
+- **MCU:** ESP32-S2 (Xtensa LX7 single-core, throttled to 160 MHz)
+- **RAM:** 320 KB SRAM
+- **Connectivity:** Wi-Fi only (no Bluetooth — the reason we needed -S3)
+- **Buttons:** D1/D2 only (GPIO1/2). Same polarity quirk as -S3.
+- **Debug:** UART console via **GPIO43/44 (DB pin)** with external
+  USB-to-UART adapter (ESP-Prog). USB-CDC is not supported in Zephyr
+  for ESP32-S2; the USB-C port only provides power and flashing.
 
 ## Project Structure
 
@@ -42,8 +60,9 @@ WeatherSensor/
 ├── docs/                  # Documentation
 │   ├── ESP-PROG-GUIDE.md # ESP-Prog hardware setup and usage
 │   └── HARDWARE.md       # Hardware architecture guide (START HERE!)
-├── boards/                # Device tree overlays
-│   └── adafruit_feather_esp32s2_tft_reverse.overlay  # Reverse board config
+├── boards/                # Device tree overlays (per board target)
+│   ├── adafruit_feather_esp32s2_tft_reverse.overlay         # -S2 fallback
+│   └── adafruit_feather_esp32s3_tft_reverse_procpu.overlay  # -S3 default
 ├── src/                   # Source files
 │   ├── main.cpp          # Application entry point (LVGL version - future)
 │   ├── main_simple.cpp   # Simple display test (CURRENT, well-documented)
@@ -72,30 +91,44 @@ source ./.venv/bin/activate
 ### Building and Flashing
 
 ```bash
-# Build WeatherSensor for ESP32-S2 Reverse TFT Feather
+# Build for ESP32-S3 Reverse TFT Feather (default since PR #13)
+west build -p always -b adafruit_feather_esp32s3_tft_reverse/esp32s3/procpu WeatherSensor
+
+# Or build for ESP32-S2 Reverse TFT Feather (fallback)
 west build -p always -b adafruit_feather_esp32s2_tft_reverse WeatherSensor
 
 # Flash to device (USB-C connected)
 west flash --esp-device /dev/cu.usbmodem01  # macOS
 # OR
 west flash  # Auto-detect (may scan multiple ports)
-
-# Monitor UART console output
-# NOTE: Requires ESP-Prog or USB-to-UART adapter
-# IMPORTANT: On Reverse board, console is GPIO43/44 (DB pin), NOT GPIO1/GPIO2!
-# ESP-Prog connections (note: ESP-Prog has internal TX/RX crossover):
-#   - ESP-Prog TXD0 -> ESP32-S2 GPIO43 (DB pin, TX)
-#   - ESP-Prog RXD0 -> ESP32-S2 GPIO44 (RX)
-#   - ESP-Prog GND  -> ESP32-S2 GND
-# Default baud rate: 115200
-
-# Monitor with screen (macOS - use cu.* not tty.*)
-screen /dev/cu.usbserial-1101 115200  # ESP-Prog UART channel
-
-# Exit screen: Ctrl+A then K then Y
 ```
 
-**See docs/ESP-PROG-GUIDE.md for complete wiring and setup instructions!**
+#### Console output
+
+**On -S3:** the console comes out the USB-C port itself via USB-CDC.
+Just open a serial terminal on `/dev/cu.usbmodem*` at any baud rate
+(USB-CDC ignores baud). No ESP-Prog needed.
+
+```bash
+# macOS
+screen /dev/cu.usbmodem01 115200
+# Exit: Ctrl+A then K then Y
+```
+
+**On -S2:** USB-CDC is not supported in Zephyr; the console comes out
+UART0 on GPIO43/44 (DB pin) and requires an external USB-to-UART adapter
+like ESP-Prog. **GPIO1/GPIO2 are BUTTONS on the Reverse board, NOT
+UART pins!**
+
+```bash
+# ESP-Prog connections (note: ESP-Prog has internal TX/RX crossover):
+#   ESP-Prog TXD0 → ESP32-S2 GPIO43 (DB pin, TX)
+#   ESP-Prog RXD0 → ESP32-S2 GPIO44 (RX)
+#   ESP-Prog GND  → ESP32-S2 GND
+screen /dev/cu.usbserial-1101 115200  # ESP-Prog UART channel
+```
+
+**See docs/ESP-PROG-GUIDE.md for complete -S2 wiring and setup instructions.**
 
 ### Quick Setup Alias (Optional)
 
@@ -108,7 +141,7 @@ alias zephyr-setup='cd /Users/lukaszronka/projects/zephyr-4.4 && source ./.venv/
 Then simply run:
 ```bash
 zephyr-setup
-west build -p always -b adafruit_feather_esp32s2_tft_reverse WeatherSensor
+west build -p always -b adafruit_feather_esp32s3_tft_reverse/esp32s3/procpu WeatherSensor
 ```
 
 ### Verifying Environment
@@ -180,13 +213,22 @@ CONFIG_UART_CONSOLE=y          # UART console output
 
 ### Device Tree Configuration
 
-Hardware configuration in `boards/adafruit_feather_esp32s2_tft_reverse.overlay`:
-- UART0 on GPIO43/44 (DB pin) for console output
+Hardware configuration lives in one overlay per board under `boards/`:
+- `adafruit_feather_esp32s3_tft_reverse_procpu.overlay` — default
+- `adafruit_feather_esp32s2_tft_reverse.overlay` — fallback
+
+Both overlays enable the same set of nodes:
 - SPI2 bus for TFT display
-- ST7789V TFT display controller
-- I2C for future sensor support
-- GPIO7 for display power control
-- GPIO45 for backlight control
+- ST7789V TFT display controller (`status = "okay"` override)
+- I2C0 (GPIO3/4) with `bias-pull-up` override for the BME280
+- BME280 child node at I2C address 0x77
+- WiFi driver (`&wifi` enabled)
+- GPIO8/A5 hog HIGH for external BME280 Vcc
+- Button polarity fix (Reverse-line hardware is inverted from upstream DTS)
+- CPU clock 160 MHz (down from 240)
+
+-S3-only: relies on USB-CDC for console (default `zephyr,console = &usb_serial`).
+-S2-only: explicit UART0 GPIO43/44 console override.
 
 ## Development Phases
 
@@ -317,7 +359,7 @@ screen /dev/cu.usbserial-1420 115200
 
 ```bash
 # Build with debug symbols
-west build -b adafruit_feather_esp32s2_tft_reverse WeatherSensor -- -DCMAKE_BUILD_TYPE=Debug
+west build -b adafruit_feather_esp32s3_tft_reverse/esp32s3/procpu WeatherSensor -- -DCMAKE_BUILD_TYPE=Debug
 
 # Flash firmware
 west flash --esp-device /dev/cu.usbmodem01
@@ -342,8 +384,9 @@ The `src/main_simple.cpp` is a clean, well-documented reference implementation d
 **Read these files to understand the system:**
 - **`docs/HARDWARE.md`** - ⭐ **START HERE!** Complete hardware architecture guide
 - `src/main_simple.cpp` - Cleaned, well-documented application code
-- `boards/adafruit_feather_esp32s2_tft_reverse.overlay` - Hardware configuration
-- `docs/ESP-PROG-GUIDE.md` - Debug console and JTAG setup
+- `boards/adafruit_feather_esp32s3_tft_reverse_procpu.overlay` - Default board overlay
+- `boards/adafruit_feather_esp32s2_tft_reverse.overlay` - Fallback board overlay
+- `docs/ESP-PROG-GUIDE.md` - Debug console and JTAG setup (-S2 only)
 
 ### Key Concepts to Master
 
@@ -415,13 +458,17 @@ for (int y = 0; y < 240; y += 30) {
 
 ### Critical Information
 
-- **Board Target:** Always use `adafruit_feather_esp32s2_tft_reverse` (NOT `..._tft`)
-- **Console UART:** GPIO43/44 (DB pin), NOT GPIO1/GPIO2 (those are buttons on Reverse!)
-- **Display Power:** GPIO7 MUST be HIGH before initializing display
-- **USB Limitation:** USB-CDC is NOT supported in Zephyr for ESP32-S2
-- **Flashing:** USB-C port works for flashing firmware via `west flash`
-- **Console Logging:** Requires ESP-Prog or USB-to-UART adapter on GPIO43/44 at 115200 baud
-- **macOS Serial:** Use `/dev/cu.*` devices, NOT `/dev/tty.*` (avoids "resource busy")
+- **Board target — default:** `adafruit_feather_esp32s3_tft_reverse/esp32s3/procpu`
+  (note the qualifier; -S3 is dual-core asymmetric, you always pick procpu).
+- **Board target — fallback:** `adafruit_feather_esp32s2_tft_reverse` (still
+  buildable, kept around for comparison with the original hardware).
+- **Display Power:** GPIO7 MUST be HIGH before initializing display. Both
+  boards. Our `display.cpp` raises it as the first init step.
+- **USB Limitation:** USB-CDC works on -S3 (console goes out USB-C directly);
+  is NOT supported in Zephyr for ESP32-S2 (need ESP-Prog).
+- **-S2 Console:** GPIO43/44 (DB pin), NOT GPIO1/GPIO2 (those are buttons!).
+- **Flashing:** USB-C port works for both boards via `west flash`.
+- **macOS Serial:** Use `/dev/cu.*` devices, NOT `/dev/tty.*` (avoids "resource busy").
 
 ### Environment Setup
 
